@@ -60,6 +60,7 @@ class Settings:
     commit_very_incomplete_ms: int = 2000  # Jev가 말하다 멈춘 것으로 볼 때 (0.25 미만)
     no_text_commit_ms: int = 1800        # 말소리는 있었는데 받아쓰기가 비어 있을 때
     live_commit_fast_ms: int = 800       # 시연 모드: 문장부호 끝·Jev 확신(0.6 이상). 0.6초는 문장 사이 0.6~0.8초 쉬는 사람에게 끼어들었다
+    commit_correct_ms: int = 2500        # 시연 모드: 말을 고치는 중('아니,' '잠깐만요' '잘못 말했어요')이면 생각하느라 오래 쉰다
     live_commit_mid_ms: int = 1000       # 시연 모드: 명사로 끝난 짧은 말·Jev 완결 0.5~0.6
     live_router_pause_ms: int = 250      # 시연 모드: Jev를 더 일찍 부른다
     spec_live: bool = True               # 시연 모드 추측 실행 (답까지의 시간 단축)

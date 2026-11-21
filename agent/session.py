@@ -95,6 +95,18 @@ def _unfinished_tail(text: str) -> str:
     return ""
 
 
+# 말을 고치는 중: 마지막 문장이 정정하는 말뿐일 때 ('…1234. 아니,' '잠깐만요.' '잘못 말했어요.' '그게 아니라')
+# "아니 배송이 왜 안 와요?"처럼 정정하는 말 뒤에 용건이 이어진 문장, 대답 "아니요"는 해당하지 않는다
+_CORRECTING = re.compile(r"^(?:(?:음|어|아|저|네|그)[\s,.…]*)?"
+                         r"(?:잘못\s*(?:말|얘기|이야기)\S*|아니(?:\s*아니)*|아냐|잠깐(?:만요|만)?|잠시만(?:요)?|"
+                         r"다시\s*(?:말할게요|말씀드릴게요|말할게|불러\s*드릴게요)|그게\s*아니(?:라|고)?)[\s,.…!?~]*$")
+
+
+def _correcting(text: str) -> bool:
+    parts = [p for p in re.split(r"(?<=[.?!])\s+", (text or "").strip()) if p.strip()]
+    return bool(parts) and bool(_CORRECTING.match(parts[-1].strip()))
+
+
 def _noun_only(text: str) -> bool:
     """물음표 없이 서술어 없는 명사로 끝난 짧은 말인가 ('대장영양제.', '배송 문의.'). 숫자를 불러 준 말은 제외한다."""
     t = text.strip()
@@ -422,7 +434,10 @@ class Session:
         r = self._route_for(text)
         live = self.mode == "live"
         t = text.strip()
-        if t.endswith((",", "，", "…", "-")):
+        if live and _correcting(t):
+            # 말을 고치는 중 (시연 모드): 생각하느라 오래 쉰다. 측정 모드는 녹음된 한 문장이라 그대로 둔다
+            thr, name = s.commit_correct_ms, "correcting"
+        elif t.endswith((",", "，", "…", "-")):
             # 쉼표·말줄임으로 끝남: 이어서 말하는 중이다 (실측 P0130-01: '대장 영양제,' 뒤 1.8초 쉬고 이어 말함)
             thr, name = s.commit_comma_ms, "comma"
         elif _unfinished_tail(t):

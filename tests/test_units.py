@@ -605,6 +605,14 @@ class LiveContinuationTest(unittest.TestCase):
         self.assertEqual(self._wait(live, "010-1234-5678."), S.live_commit_fast_ms)
         self.assertEqual(self._wait(live, "배송이 언제 오나요?"), S.live_commit_fast_ms)
 
+    def test_correcting_waits_long_in_live_only(self):
+        live, meas = self._sess("live"), self._sess("measure")
+        for t in ("제 번호는 010 1234. 아니,", "잠깐만요.", "잘못 말했어요.", "그게 아니라"):
+            self.assertEqual(self._wait(live, t), S.commit_correct_ms, t)                   # 말을 고치는 중: 2.5초
+        self.assertEqual(self._wait(meas, "잠깐만요."), S.commit_complete_ms)              # 측정 모드는 그대로
+        for t in ("아니 배송이 왜 안 와요?", "아니요, 괜찮아요."):
+            self.assertEqual(self._wait(live, t), S.live_commit_fast_ms, t)                  # 용건이 이어진 문장·대답은 해당 없음
+
     def test_mergeable_only_before_real_answer(self):
         ss = self._sess()
         ss.turn_customer, ss.opener_text = "제 번호는 010 1234", "네, 확인해 드리겠습니다."
