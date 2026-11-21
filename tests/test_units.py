@@ -236,5 +236,25 @@ class RateLimitTest(unittest.TestCase):
         asyncio.run(run())
 
 
+class GuardTest(unittest.TestCase):
+    def test_fixed_answer_guard(self):
+        from agent.router import needs_llm
+        self.assertEqual(needs_llm("배송은 언제 오는지랑 배송비가 얼마인지 알려 주세요."), "compound")
+        self.assertEqual(needs_llm("간 영양제 효과가 어떤지 알고 싶고 주문은 어떻게 하는지도 알려 주세요."), "compound")
+        self.assertEqual(needs_llm("제품을 먹고 나서 두드러기가 났어요. 환불해 주세요."), "symptom")
+        # 용건이 하나인 말은 그대로 고정 답으로 간다 (효과가 없다는 말은 반품 사유)
+        for t in ("택배가 아직도 안 왔는데 어떻게 된 건가요?", "반품하고 싶은데요.", "눈 영양제 하나 사려고요.",
+                  "3일째 먹는데 아직도 변을 못봤어요 환불신청합니다", "먹어도 효과가 없어서 환불해 주세요.",
+                  "환불이 아직 안 들어왔는데 언제 되나요?"):
+            self.assertEqual(needs_llm(t), "", t)
+
+    def test_search_guard(self):
+        from agent.toolflow import product_mentioned
+        for q in ("조인플렉스 2개", "하루온혈관캐어 2개", "밀크씨슬 성분", "루테인 하루 몇 알", "유산균 추천", "간 영양제 효과"):
+            self.assertTrue(product_mentioned(q), q)
+        for q in ("선박스 효과", "3박스 효과", "효과 있나요", "하루에 몇 알 먹어요", "언제 먹는 게 좋아요", "제품 가격", ""):
+            self.assertFalse(product_mentioned(q), q)
+
+
 if __name__ == "__main__":
     unittest.main()

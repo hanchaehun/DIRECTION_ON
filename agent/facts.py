@@ -141,6 +141,8 @@ def resolve_ids(name: str, args: dict, ctx: dict, max_phone_dist: int = 3, max_o
 
 def valid_phone(v) -> bool:
     d = digits(v)
+    if d.startswith("010"):
+        return len(d) == 11              # 휴대폰은 11자리. 덜 들린 번호(실측 P0193-02 '010-3710-35')로 조회하지 않는다
     return 9 <= len(d) <= 11 and d.startswith("0")
 
 

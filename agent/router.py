@@ -228,15 +228,44 @@ def keyword_route(text: str, history: list[dict], caller: dict | None) -> str | 
     return None
 
 
+# 고정 답은 질문 하나에만 맞는다. 용건이 둘이거나 몸에 이상이 생겼다는 말이면 LLM이 답한다.
+# LLM으로 넘겨도 첫 소리는 미리 합성한 첫마디가 나가므로 속도는 그대로다.
+_SYMPTOM = re.compile(r"(두드러기|발진|가려[워운움]|복통|배가\s*아프|배\s*아프|설사|구토|토했|메스꺼|속이\s*(안|쓰|메|불편)|어지러|어지럽|"
+                      r"부작용|알레르기|알러지|이상\s*(증상|반응)|탈이\s*났|병원|응급|두통|부었)")
+_TOPICS = (
+    ("ship", re.compile(r"(배송(?!비)|도착|택배|송장|언제\s*(와|오|받))")),
+    ("fee", re.compile(r"(배송비|결제|카드|쿠폰|적립금|포인트|계좌|현금영수증|회원|가격|얼마)")),
+    ("return", re.compile(r"(반품|환불|환풀|교환|취소)")),
+    # 제품에 대해 '묻는' 말만 센다. "먹었는데 효과가 없어서 환불"은 반품 사유이지 제품 문의가 아니다
+    ("product", re.compile(r"(효과|효능|성분|섭취|복용|먹)[^.?!]{0,10}(어떤|어떻게|알려|궁금|있나요|있을까요|인가요|는지|될까요|되나요|좋나요|좋을까요)"
+                           r"|(어떤|무슨)\s*(효과|효능|성분)")),
+    ("buy", re.compile(r"((구매|구입)|사고\s*싶|살려고|사려고|주문\s*(방법|하려|할려|하고\s*싶|은\s*어떻게))")),
+)
+
+
+def needs_llm(text: str) -> str:
+    """고정 답으로 답하면 안 되는 이유(없으면 빈 문자열). 'symptom' = 섭취 후 이상 증상, 'compound' = 용건이 둘 이상."""
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if _SYMPTOM.search(t):
+        return "symptom"
+    if sum(1 for _, rx in _TOPICS if rx.search(t)) >= 2:
+        return "compound"
+    return ""
+
+
 def choose_bank(text: str, history: list[dict], caller: dict | None, r: Route | None, s) -> tuple[str | None, str]:
     """(은행 답 키 또는 None, 근거). 고정 답은 틀리면 안 되므로 보수적으로 낸다.
     - 인사만 한 경우: 키워드만으로 낸다.
+    - 용건이 둘 이상이거나 섭취 후 이상 증상을 말하면 내지 않는다 → LLM.
     - Jev 확신도가 높으면(bank_min_conf 이상) Jev 단독으로 낸다.
     - 키워드 후보가 있고 Jev도 같은 계열로 판단하면 낸다.
     - Jev 결과가 없으면(시간 초과) 내지 않는다 → LLM."""
     kw = keyword_route(text, history, caller)
     if kw == "greeting":
         return kw, "keyword"
+    why = needs_llm(text)
+    if why:
+        return None, why
     if r is None or not r.ok:
         return None, "no-jev"
     jv_hi = decide_bank(r, text, history, caller, s)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -34,18 +35,37 @@ _HEALTH = ("간", "눈", "관절", "연골", "기관지", "호흡", "목", "혈�
            "세트", "영양제", "가드", "맥스", "88")
 
 
+# 검색어에서 빼고 보는 말: 어느 제품에나 붙는 일반어, 수량, 묻는 말투. 이것을 빼고 남는 말이 없으면 무엇을 찾는지 알 수 없다.
+_GENERIC = re.compile(r"(하루온|\d+\s*(박스|개월|개|통|병|알|정|포|일|주|달|번|회)?|박스|효과|효능|섭취|복용|방법|가격|얼마|구성|성분|"
+                      r"제품|상품|추천|문의|정보|관련|대해|기간|동안|"
+                      r"먹(으면|어도|는데|는|고|어)?|드시(면|는)?|드세요|있(나요|어요|을까요|는지|습니까)|되(나요|는지)|"
+                      r"좋(은|아요|을까요|나요)|어떤|어떻게|언제|하루에|하루|몇|이거|그거|저거|이것|그것|알려|주세요|궁금)")
+
+
 def product_mentioned(query: str) -> bool:
-    """검색어에 제품명 조각이나 건강 고민이 있는가. 없으면 모의 서버가 아무 제품이나 '가장 가까운 기록'으로 돌려준다
-    (실측: 받아쓰기 '선박스 효과'로 검색해 기관지 제품으로 답함)."""
-    q = __import__("re").sub(r"\s+", "", str(query or "")).replace("하루온", "")
+    """검색어에 무엇을 찾는지 알 수 있는 말이 있는가. 없으면 모의 서버가 아무 제품이나 '가장 가까운 기록'으로 돌려준다
+    (실측: 받아쓰기 '선박스 효과'로 검색해 기관지 제품으로 답함).
+    제품명 조각·건강 고민이 있으면 통과. 그 밖에는 일반어를 뺀 뒤 두 글자 이상 남으면 통과시킨다 — 목록에 없는 성분명·제품 별칭
+    (밀크씨슬, 혈관캐어)을 막지 않기 위해서다. 검색은 더 불러도 감점이 없고, 막으면 필요한 호출을 놓친다."""
+    raw = str(query or "")
+    q = re.sub(r"\s+", "", raw).replace("하루온", "")
     if not q:
         return False
     tokens = set()
     for n in knowledge.product_names():
-        for w in __import__("re").split(r"[\s&]+", n.replace("하루온", "")):
+        for w in re.split(r"[\s&]+", n.replace("하루온", "")):
             if len(w) >= 2:
                 tokens.add(w)
-    return any(t in q for t in tokens) or any(h in q for h in _HEALTH)
+    if any(t in q for t in tokens) or any(h in q for h in _HEALTH):
+        return True
+    for w in _GENERIC.sub(" ", raw).split():
+        w = re.sub(r"(이요|요|은|는|이|가|을|를|도|에|의)$", "", re.sub(r"[^가-힣A-Za-z]", "", w))
+        if len(w) >= 2:
+            return True
+    return False
+
+
+_EXAMPLE_PHONES = {"01012345678", "01000000000", "01011112222", "01012341234"}
 
 
 def reask_kind(name: str, args: dict, blocked: str) -> str:
@@ -83,6 +103,10 @@ def reask_for(runs: list) -> str:
 
 def block_reason(name: str, args: dict, ctx: dict) -> str:
     """함수를 실행하면 안 되는 경우. 번호가 깨져 들린 채로 접수·조회하면 틀린 호출이 된다."""
+    # 형식 예시 번호를 그대로 넣은 호출 (실측 P0193-02: 번호가 덜 들리자 '010-1234-5678'로 조회함)
+    for k in ("buyer_cellphone", "customer_phone_number", "phone_number"):
+        if facts.digits(args.get(k)) in _EXAMPLE_PHONES:
+            return "전화번호가 정확히 들리지 않았다. 조회하지 않았다." if name in LOOKUPS else "전화번호가 정확하지 않다. 접수하지 않았다."
     if name == "search_products" and not product_mentioned(args.get("query")):
         return "검색어에 제품명이나 건강 고민이 없다. 검색하지 않았다. 고객에게 어떤 제품을 문의하시는지 여쭌다."
     if name == "request_callback":
