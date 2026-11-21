@@ -77,6 +77,7 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
 
     guard_used = False
     all_runs: list = []
+    new_hist_all: list = []
     prior_write = toolflow.history_write_succeeded(hist)
     failed_before = toolflow.lookup_failed_before(hist)
     while True:
@@ -84,6 +85,8 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
             if rounds == 0 and directlib.has_mark(d.text):
                 out["direct_pick"] = d.text.split("]", 1)[0] + "]"
             d.text = directlib.expand(d.text, allow=(rounds == 0))
+            if rounds > 0:
+                d.text = aftertool.expand(d.text)
         if d.kind == "answer" and not guard_used and claims_lookup_without_evidence(d.text, evid):
             guard_used = True
             out["notes"].append("조회 없이 확인했다고 답하려 함 → 다시 판단")
@@ -111,6 +114,15 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
                 guard_used = True
                 out["notes"].append("성공한 접수 없이 접수했다고 함 → 다시 판단")
                 msgs = msgs + [d.assistant_msg, {"role": "system", "content": toolflow.WRITE_NOTE}]
+                d = await brain.decide(msgs, tools, effort)
+                llm_calls += 1
+                continue
+        if d.kind == "answer" and not guard_used:
+            bad_dates = toolflow.offers_cancelled_order(d.text, hist + new_hist_all)
+            if bad_dates:
+                guard_used = True
+                out["notes"].append("취소된 주문을 선택지로 제시 → 다시 판단")
+                msgs = msgs + [d.assistant_msg, {"role": "system", "content": toolflow.cancelled_note(bad_dates)}]
                 d = await brain.decide(msgs, tools, effort)
                 llm_calls += 1
                 continue
@@ -148,7 +160,8 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
             new_hist += [{"role": "tool_call", "name": run.tc.name, "arguments": run.args},
                          {"role": "tool_result", "name": run.tc.name, "result": run.body}]
         evid += evidence_text(runs) + "\n"
-        ctx = facts.context_ids(hist + new_hist, caller)
+        new_hist_all += new_hist
+        ctx = facts.context_ids(hist + new_hist_all, caller)
         rk = reask_for(runs)
         if rk:
             out["notes"].append(f"번호 다시 묻기({rk})")

@@ -914,7 +914,7 @@ class Feedback2Test(unittest.TestCase):
         from agent import facts
         body = {"status": "ok", "data": {"orders": [{"주문번호": "20260924-0076068", "상세주문번호": "20260924-0076068-01",
                 "주문일자": "2026-09-24 10:00:00", "제품명": "x", "옵션": "x", "수량": 1, "결제여부": "T", "배송상태": "취소완료"}]}}
-        self.assertIn("반품·교환 대상 아님", facts.render_tool_result("get_order_info", body, datetime(2026, 10, 1, 12)))
+        self.assertIn("반품·교환 대상이 절대 아님", facts.render_tool_result("get_order_info", body, datetime(2026, 10, 1, 12)))
 
     def test_needs_return_lookup(self):
         from agent.toolflow import needs_return_lookup
@@ -923,6 +923,58 @@ class Feedback2Test(unittest.TestCase):
         self.assertFalse(needs_return_lookup("반품하고 싶어요", [], True))                 # 진행 문의가 아님
         done = [{"role": "tool_result", "name": "get_return_info", "result": {"status": "ok"}}]
         self.assertFalse(needs_return_lookup("환불 아직 안 들어왔어요", done, True))       # 이미 조회함
+
+
+class CancelledOrderTest(unittest.TestCase):
+    """[명심] 취소된 주문은 반품·교환 대상이 절대 아니다: 조회 결과에서 찾아 접수를 막는다."""
+
+    def _history(self):
+        orders = [
+            {"주문번호": "20260929-0022095", "상세주문번호": "20260929-0022095-01", "배송상태": "배송완료"},
+            {"주문번호": "20260924-0076068", "상세주문번호": "20260924-0076068-01", "배송상태": "취소완료"},
+            {"주문번호": "20260925-0017916", "상세주문번호": "20260925-0017916-01", "배송상태": "배송완료"},
+            {"주문번호": "20260925-0017916", "상세주문번호": "20260925-0017916-02", "배송상태": "입금전취소"},
+        ]
+        return [{"role": "tool_result", "name": "get_order_info", "result": {"status": "ok", "data": {"orders": orders}}}]
+
+    def test_context_collects_cancelled(self):
+        from agent import facts
+        ctx = facts.context_ids(self._history(), None)
+        self.assertEqual(ctx["cancelled_orders"], ["20260924-0076068"])                 # 모든 상품이 취소된 주문만
+        self.assertEqual(ctx["cancelled_items"], ["20260924-0076068-01", "20260925-0017916-02"])
+
+    def test_block_return_and_exchange(self):
+        from agent import facts
+        from agent.toolflow import block_reason
+        ctx = facts.context_ids(self._history(), None)
+        for name in ("return_order", "exchange_order"):
+            self.assertIn("취소된 주문", block_reason(name, {"order_number": "20260924-0076068", "reason": "x"}, ctx))
+        self.assertEqual(block_reason("return_order", {"order_number": "20260929-0022095", "reason": "x"}, ctx), "")   # 배송완료는 접수 가능
+        part = {"order_number": "20260925-0017916", "reason": "x",
+                "return_items": [{"order_item_code": "20260925-0017916-02", "quantity": 1}]}
+        self.assertIn("취소된 상품", block_reason("return_order_item", part, ctx))
+        ok = {"order_number": "20260925-0017916", "reason": "x",
+              "return_items": [{"order_item_code": "20260925-0017916-01", "quantity": 1}]}
+        self.assertEqual(block_reason("return_order_item", ok, ctx), "")                 # 같은 주문의 취소 안 된 상품은 가능
+
+    def test_guard_cancelled_choice(self):
+        from agent.toolflow import offers_cancelled_order, cancelled_only_dates
+        orders = [{"주문번호": "20260929-0022095", "주문일자": "2026-09-29 22:05:11", "배송상태": "배송완료"},
+                  {"주문번호": "20260924-0076068", "주문일자": "2026-09-24 10:00:00", "배송상태": "취소완료"},
+                  {"주문번호": "20260925-0017916", "주문일자": "2026-09-25 09:00:00", "배송상태": "배송완료"},
+                  {"주문번호": "20260925-0017917", "주문일자": "2026-09-25 11:00:00", "배송상태": "취소완료"}]
+        h = [{"role": "tool_result", "name": "get_order_info", "result": {"status": "ok", "data": {"orders": orders}}}]
+        self.assertEqual(cancelled_only_dates(h), {(9, 24)})                              # 9/25는 취소 안 된 주문도 있어 제외
+        q = "확인해 보니 주문이 여러 건 확인됩니다. 9월 29일 이눌린 배변 가드와 9월 24일 이눌린 배변 가드 중 어느 주문 건인지 말씀해 주시겠어요?"
+        self.assertEqual(offers_cancelled_order(q, h), [(9, 24)])
+        self.assertEqual(offers_cancelled_order("9월 29일 이눌린 배변 가드 주문이 맞으실까요?", h), [])   # 묻는 말이 아니면 해당 없음
+        self.assertEqual(offers_cancelled_order("9월 29일과 9월 25일 중 어느 주문인가요?", h), [])
+
+    def test_summary_marks_cancelled(self):
+        from agent import facts
+        body = self._history()[0]["result"]
+        txt = facts.render_tool_result("get_order_info", body, datetime(2026, 10, 1, 12))
+        self.assertIn("[명심] 취소된 주문: 반품·교환 대상이 절대 아님", txt)
 
 
 if __name__ == "__main__":

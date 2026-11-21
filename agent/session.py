@@ -831,6 +831,9 @@ class Session:
             if decision.kind == "answer" and decision.text:
                 # 직접 답의 첫 문장 번호([D번호]) → 미리 합성한 문장. 함수 결과 뒤 답에서는 번호 표시만 지운다
                 decision.text = directlib.expand(decision.text, allow=(rounds == 0))
+                if rounds > 0:
+                    # 함수 결과 뒤 답의 첫 문장 번호([n]). 가드로 다시 판단한 답도 여기서 펼친다 (이미 펼친 답은 그대로)
+                    decision.text = aftertool.expand(decision.text)
             if (decision.kind == "answer" and not guard_used
                     and claims_lookup_without_evidence(decision.text, self.evid)):
                 guard_used = True
@@ -860,6 +863,15 @@ class Session:
                     self.tl.event("guard", why="성공한 접수 없이 접수했다고 함")
                     msgs += [decision.assistant_msg, {"role": "system", "content": toolflow.WRITE_NOTE}]
                     decision = await self._decide(msgs, s.reasoning_effort)
+                    continue
+            if decision.kind == "answer" and not guard_used:
+                bad_dates = toolflow.offers_cancelled_order(decision.text, self.history)
+                if bad_dates:
+                    # [명심] 취소된 주문을 반품·교환 선택지로 제시하려 함 → 빼고 다시 답하게 한 번 되돌린다
+                    guard_used = True
+                    self.tl.event("guard", why="취소된 주문을 선택지로 제시")
+                    msgs += [decision.assistant_msg, {"role": "system", "content": toolflow.cancelled_note(bad_dates)}]
+                    decision = await self._decide(msgs, s.reasoning_effort_round2 if rounds else s.reasoning_effort)
                     continue
             if (decision.kind == "answer" and not guard_used and rounds == 0 and not failed_before
                     and toolflow.needs_return_lookup(self.turn_customer, self.history, bool(self.ctx_ids.get("phones")))):

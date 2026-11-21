@@ -71,7 +71,30 @@ def context_ids(history: list[dict], caller: dict | None) -> dict:
             if m.group(3):
                 items.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
     uniq = lambda xs: list(dict.fromkeys(xs))
-    return {"phones": uniq(phones), "orders": uniq(orders), "items": uniq(items), "caller_phone": cp if valid_phone(cp) else ""}
+    cancelled_orders, cancelled_items = cancelled_ids(history)
+    return {"phones": uniq(phones), "orders": uniq(orders), "items": uniq(items), "caller_phone": cp if valid_phone(cp) else "",
+            "cancelled_orders": cancelled_orders, "cancelled_items": cancelled_items}
+
+
+CANCELLED = ("취소완료", "입금전취소")
+
+
+def cancelled_ids(history: list[dict]) -> tuple[list[str], list[str]]:
+    """조회 결과에서 취소된 주문·상품. (모든 상품이 취소된 주문번호, 취소된 상세주문번호)
+    [명심] 취소된 주문은 반품·교환 대상이 절대 아니다."""
+    lines: dict[str, list[bool]] = {}
+    items: list[str] = []
+    for h in history or []:
+        if h.get("role") != "tool_result" or h.get("name") != "get_order_info":
+            continue
+        res = h.get("result") if isinstance(h.get("result"), dict) else {}
+        for o in ((res.get("data") or {}).get("orders") or []) if isinstance(res.get("data"), dict) else []:
+            no, cancelled = str(o.get("주문번호") or ""), o.get("배송상태") in CANCELLED
+            if no:
+                lines.setdefault(no, []).append(cancelled)
+            if cancelled and o.get("상세주문번호"):
+                items.append(str(o["상세주문번호"]))
+    return [no for no, flags in lines.items() if flags and all(flags)], list(dict.fromkeys(items))
 
 
 def _snap(value: str, candidates: list[str], max_dist: int) -> str | None:
@@ -258,8 +281,8 @@ def render_tool_result(name: str, body, now: datetime) -> str:
                 bits.append(f"주문일 {kdate(od, now)} {od:%H:%M} ({when})")
             means = ", ".join(o.get("결제수단") or []) if isinstance(o.get("결제수단"), list) else str(o.get("결제수단") or "")
             bits.append(f"결제수단 {means or '불명'}, {pay}" + (f" ({kdate(pd, now)})" if pd and o.get("결제여부") == "T" else ""))
-            bits.append(f"배송상태 {st}" + (" (취소된 주문: 반품·교환 대상 아님, 반품할 주문을 여쭐 때 선택지에서 뺀다)"
-                                           if st in ("취소완료", "입금전취소") else ""))
+            bits.append(f"배송상태 {st}" + (" ([명심] 취소된 주문: 반품·교환 대상이 절대 아님. 접수하지 않고, 반품·교환할 주문을 여쭐 때 선택지에도 넣지 않는다)"
+                                           if st in CANCELLED else ""))
             if o.get("송장번호"):
                 bits.append(f"송장번호 {o['송장번호']}")
             if o.get("출고예정일자"):

@@ -116,6 +116,15 @@ def block_reason(name: str, args: dict, ctx: dict) -> str:
             return "전화번호가 정확하지 않다. 접수하지 않았다."
         if not str(args.get("customer_name") or "").strip():
             return "성함이 없다. 접수하지 않았다. 고객에게 성함을 여쭌다."
+    if name in ("return_order", "return_order_item", "exchange_order"):
+        # [명심] 취소된 주문은 반품·교환 대상이 절대 아니다 (실측 P0074-01: 취소완료 주문을 반품 선택지로 제시)
+        no = facts.digits(args.get("order_number"))
+        if no and no in {facts.digits(x) for x in ctx.get("cancelled_orders") or []}:
+            return "취소된 주문은 반품·교환 대상이 아니다. 접수하지 않았다. 취소된 주문이라 반품·교환할 수 없다고 안내한다."
+        if name == "return_order_item":
+            codes = {str(x.get("order_item_code")) for x in (args.get("return_items") or []) if isinstance(x, dict)}
+            if codes & set(ctx.get("cancelled_items") or []):
+                return "취소된 상품은 반품 대상이 아니다. 접수하지 않았다. 취소된 상품이라 반품할 수 없다고 안내한다."
     if name in ("cancel_order", "return_order", "exchange_order"):
         key = "order_id" if name == "cancel_order" else "order_number"
         v = args.get(key)
@@ -297,3 +306,40 @@ def needs_return_lookup(customer_text: str, history: list, has_phone: bool) -> b
     if not has_phone or not _RETURN_STATUS.search(customer_text or ""):
         return False
     return not any(h.get("role") == "tool_result" and h.get("name") == "get_return_info" for h in history or [])
+
+
+# [명심] 취소된 주문은 반품·교환 대상이 절대 아니다: 어느 주문인지 여쭐 때 선택지에 넣으면 한 번 되돌린다
+# (실측 P0074-01: 지시를 넣어도 '9월 29일 … 9월 24일(취소완료) … 중 어느 주문'으로 물었다)
+_WHICH = re.compile(r"(어느|어떤)\s*(주문|건|것|제품)")
+_MD = re.compile(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+
+
+def cancelled_only_dates(history: list) -> set:
+    """취소된 주문만 있는 주문일 (같은 날 취소 안 된 주문이 있으면 빼서 헷갈리지 않게)."""
+    cancelled, alive = set(), set()
+    for h in history or []:
+        if h.get("role") != "tool_result" or h.get("name") != "get_order_info":
+            continue
+        res = h.get("result") if isinstance(h.get("result"), dict) else {}
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
+        for o in data.get("orders") or []:
+            m = re.match(r"\d{4}-(\d{1,2})-(\d{1,2})", str(o.get("주문일자") or ""))
+            if not m:
+                continue
+            md = (int(m.group(1)), int(m.group(2)))
+            (cancelled if o.get("배송상태") in facts.CANCELLED else alive).add(md)
+    return cancelled - alive
+
+
+def offers_cancelled_order(text: str, history: list) -> list:
+    """어느 주문인지 묻는 답에 취소된 주문의 날짜가 들어 있으면 그 날짜들."""
+    if not _WHICH.search(text or ""):
+        return []
+    bad = cancelled_only_dates(history)
+    return sorted({(int(a), int(b)) for a, b in _MD.findall(text)} & bad)
+
+
+def cancelled_note(dates: list) -> str:
+    when = ", ".join(f"{m}월 {d}일" for m, d in dates)
+    return (f"(시스템: [명심] {when} 주문은 취소된 주문이라 반품·교환 대상이 절대 아니다. 선택지에서 빼고 다시 답한다. "
+            "반품·교환할 수 있는 주문이 하나뿐이면 그 주문이 맞는지 확인한다.)")
