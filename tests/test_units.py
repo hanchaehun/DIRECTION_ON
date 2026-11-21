@@ -655,20 +655,21 @@ class PaceTest(unittest.TestCase):
         r = pace.turn_rate("배송이 언제쯤 도착하는지 궁금합니다", 5000, S)                     # 16자 / 5초
         self.assertAlmostEqual(r, 3.2, places=1)
 
-    def test_adjust_only_lengthens_within_cap(self):
+    def test_adjust_range(self):
         from agent import pace
         kw = dict(s=S, mode="live")
-        self.assertEqual(pace.adjust(600, "punct", rate=7.0, own_pause_ms=0, **kw)[0], 600)      # 빠른 사람: 그대로 (줄이지 않는다)
-        self.assertEqual(pace.adjust(600, "punct", rate=None, own_pause_ms=0, **kw)[0], 600)     # 근거 없음
-        slow, info = pace.adjust(600, "punct", rate=3.0, own_pause_ms=0, **kw)
-        self.assertAlmostEqual(slow, 600 * S.pace_max_factor)                                    # 느린 사람: 최대 배율
-        self.assertEqual(info["base_ms"], 600)
-        mid, _ = pace.adjust(600, "punct", rate=4.6, own_pause_ms=0, **kw)
+        self.assertEqual(pace.adjust(600, "punct", rate=8.0, own_pause_ms=0, **kw)[0], 600)     # 빠른 사람: 줄이지 않는다
+        self.assertEqual(pace.adjust(600, "punct", rate=S.pace_ref_cps, own_pause_ms=0, **kw)[0], 600)  # 기준 속도: 그대로
+        self.assertEqual(pace.adjust(600, "punct", rate=None, own_pause_ms=0, **kw)[0], 600)     # 근거 없음: 그대로
+        slow, _ = pace.adjust(600, "punct", rate=3.0, own_pause_ms=0, **kw)
+        self.assertAlmostEqual(slow, 600 * S.pace_max_factor)                                   # 느린 사람: 1.2배까지
+        mid, _ = pace.adjust(600, "punct", rate=4.8, own_pause_ms=0, **kw)
         self.assertTrue(600 < mid < slow)
-        own, _ = pace.adjust(600, "punct", rate=None, own_pause_ms=800, **kw)
-        self.assertAlmostEqual(own, 800 * S.pace_pause_margin)                                   # 본인이 쉬던 만큼은 기다린다
+        kept, info = pace.adjust(600, "punct", rate=8.0, own_pause_ms=560, **kw)
+        self.assertAlmostEqual(kept, 560 * S.pace_pause_margin)                                 # 빨라도 본인이 쉬던 만큼은 기다린다
+        self.assertEqual(info["base_ms"], 600)
         capped, _ = pace.adjust(600, "punct", rate=None, own_pause_ms=3000, **kw)
-        self.assertEqual(capped, 600 + S.pace_max_extra_live_ms)                                 # 상한
+        self.assertAlmostEqual(capped, 600 * S.pace_max_factor)                                 # 상한 1.2배
         self.assertEqual(pace.adjust(2000, "connective", rate=2.0, own_pause_ms=900, **kw)[0], 2000)  # 이미 긴 규칙은 그대로
         self.assertEqual(pace.adjust(1000, "punct", rate=2.0, own_pause_ms=900, s=S, mode="measure")[0], 1000)  # 측정 모드 기본 끔
 
@@ -687,14 +688,14 @@ class PaceTest(unittest.TestCase):
         q = "배송이 언제쯤 도착하는지 궁금합니다."
         fast = h._sess("live")
         fast.turn_voiced_ms = 2500                                                               # 16자 / 2.5초 = 6.4자/초
-        self.assertEqual(h._wait(fast, q), S.live_commit_fast_ms)
+        self.assertEqual(h._wait(fast, q), S.live_commit_fast_ms)                                # 빠른 사람: 그대로
         slow = h._sess("live")
         slow.turn_voiced_ms = 5000                                                               # 3.2자/초
-        self.assertEqual(h._wait(slow, q), 850)                                                  # 600 × 1.4 = 840 → 50ms 단위로 850
+        self.assertEqual(h._wait(slow, q), 750)                                                  # 600 × 1.2 = 720 → 50ms 단위로 750
         self.assertEqual(slow.tl.info["pace"]["base_ms"], 600)
         learned = h._sess("live")
-        learned.pace.note_pause(900)                                                             # 지난번에 0.9초 쉬고 이어 말한 사람
-        self.assertEqual(h._wait(learned, "네 맞아요."), 1150)                                   # 900 × 1.25 = 1125 → 1150
+        learned.pace.note_pause(500)                                                             # 지난번에 0.5초 쉬고 이어 말한 사람
+        self.assertEqual(h._wait(learned, "네 맞아요."), 650)                                    # 500 × 1.25 = 625 → 650 (상한 720 안)
         meas = h._sess("measure")
         meas.turn_voiced_ms = 5000
         self.assertEqual(h._wait(meas, q), S.commit_complete_ms)                                 # 측정 모드는 그대로 1.0초

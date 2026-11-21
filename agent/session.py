@@ -447,7 +447,7 @@ class Session:
         base_thr = thr
         pace_info: dict = {}
         if pace.enabled(s, self.mode) and name in pace.ADJUSTABLE:
-            # 느리게 말하는 사람, 말 중간에 길게 쉬는 사람은 더 기다린다 (늘리기만 한다)
+            # 느리게 말하는 사람·말 중간에 길게 쉬는 사람은 더 기다린다 (1.0~1.2배, 줄이지는 않는다)
             rate = pace.turn_rate(t, self.turn_voiced_ms, s) or self.pace.rate
             own = max(max(self.turn_pauses, default=0.0), self.pace.pause_hint())
             thr, pace_info = pace.adjust(thr, name, rate=rate, own_pause_ms=own, s=s, mode=self.mode)

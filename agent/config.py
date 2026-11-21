@@ -66,9 +66,10 @@ class Settings:
     spec_measure: bool = False           # 측정 모드에서는 끈다 (첫 소리는 미리 합성한 음성이라 점수에 영향 없음, 호출만 는다)
     tts_unit_chars: int = 70             # 한 번에 합성하는 글자 수 상한 (긴 문장은 TTS가 7초를 넘긴 실측)
     sentence_gap_ms: int = 150           # 문장 사이 숨
-    pace_adapt: str = "live"             # 말 속도·쉼에 맞춰 말 끝 대기를 늘린다: off / live(시연만) / all. 합성 음성은 속도와 쉼이 무관해 측정 모드는 끔
-    pace_ref_cps: float = 5.3            # 기준 발음 속도(글자/초, 쉼 제외). 이보다 느리면 그 비율만큼 더 기다린다
-    pace_max_factor: float = 1.4
+    pace_adapt: str = "live"             # 말 속도·쉼에 맞춰 말 끝 대기를 조절한다: off / live(시연만) / all. 합성 음성은 속도와 쉼이 무관해 측정 모드는 끔
+    pace_ref_cps: float = 5.3            # 기준 발음 속도(글자/초, 쉼 제외). 배율 = 기준 ÷ 이 사람 속도 (느리면 길게)
+    pace_min_factor: float = 1.0         # 줄이지 않는다 (빠른 사람도 기본 대기 유지: 줄이면 끼어들 위험)
+    pace_max_factor: float = 1.2         # 느리게 말하는 사람: 대기를 최대 1.2배로 늘린다
     pace_max_extra_live_ms: int = 600    # 늘어나는 대기의 상한 (시연)
     pace_max_extra_measure_ms: int = 300  # (측정: 첫 소리가 1.5초 안에 남는 범위)
     pace_min_chars: int = 8              # 이보다 짧은 말로는 속도를 재지 않는다
