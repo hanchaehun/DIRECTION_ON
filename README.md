@@ -23,7 +23,7 @@
 ## 전체 흐름
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#000000", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#808080", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
 flowchart LR
   A([손님 음성]) --> B[받아쓰기]
   B --> J{{Jev 판정<br/>끝났나 · 화났나 · 용건}}
@@ -43,11 +43,12 @@ flowchart LR
   L2 --> T2[녹음 첫 문장 + 합성]
 
   classDef default fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+  linkStyle default stroke:#808080,stroke-width:3px;
   classDef jev fill:#ffffff,stroke:#000000,stroke-width:5px,color:#000000,font-weight:bold;
   class J jev;
 ```
 
-"녹음" = 미리 합성해 둔 음성(바로 나감) · 굵은 테두리 = 판정 모델 Jev · 점선 = Jev 판정이 참고로 들어감
+"녹음" = 미리 합성해 둔 음성(바로 나감) · 굵은 테두리 = 판정 모델 Jev · 회색 점선 = Jev 판정이 참고로 들어감
 
 ---
 
@@ -154,13 +155,14 @@ flowchart LR
 | 말 속도 맞춤 (pace) | 발동 안 함 | 느린 사람: 대기 최대 1.2배, 재생 0.85배 |
 
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#000000", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#808080", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
 flowchart LR
   T1[1턴<br/>기록만] --> T2[2턴<br/>느리면 대기 늘림 · 재생 느리게]
   T2 -- 끊김 --> X[이어 말한 것으로 합침<br/>그 쉼을 학습]
   X --> T3[3턴<br/>학습한 쉼만큼 기다림]
 
   classDef default fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+  linkStyle default stroke:#808080,stroke-width:3px;
 ```
 
 ---
