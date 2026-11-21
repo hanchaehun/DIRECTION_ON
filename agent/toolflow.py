@@ -285,3 +285,15 @@ def add_return_lookup(decision, customer_text: str, caller_phone: str = "") -> b
     if isinstance(msg.get("tool_calls"), list):
         msg["tool_calls"].append({"id": new.id, "type": "function", "function": {"name": new.name, "arguments": raw}})
     return True
+
+
+RETURN_NOTE = ("(시스템: 반품·환불 진행 상황 문의다. 답하기 전에 전화번호([통화 정보]의 발신자 번호나 대화의 번호)로 "
+               "get_return_info를 먼저 조회하고 그 결과로 답한다.)")
+
+
+def needs_return_lookup(customer_text: str, history: list, has_phone: bool) -> bool:
+    """반품·환불 진행 문의인데 조회 없이 답하려는 경우 (실측 P0031-02: 함수 없이 일반론으로 답함).
+    전화번호가 있고, 이전 대화에 반품 조회 결과가 아직 없을 때만."""
+    if not has_phone or not _RETURN_STATUS.search(customer_text or ""):
+        return False
+    return not any(h.get("role") == "tool_result" and h.get("name") == "get_return_info" for h in history or [])

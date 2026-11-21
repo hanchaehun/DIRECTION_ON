@@ -645,7 +645,7 @@ class LiveContinuationTest(unittest.TestCase):
 
 
 class PaceTest(unittest.TestCase):
-    """말 속도·쉼에 맞춘 대기 조절: 늘리기만 하고, 근거가 없으면 그대로, 측정 모드는 기본 끔."""
+    """말 속도·쉼에 맞춘 대기 조절: 늘리기만 하고, 근거가 없으면 그대로, 이전 턴 기록이 없으면(채점) 발동하지 않음."""
 
     def test_turn_rate_needs_evidence(self):
         from agent import pace
@@ -701,11 +701,14 @@ class PaceTest(unittest.TestCase):
         slow = h._sess("live")
         slow.pace.note_rate(3.2)                                                                 # 이전 턴에 느리게 말한 사람
         slow.turn_voiced_ms = 5000                                                               # 3.2자/초
-        self.assertEqual(h._wait(slow, q), 750)                                                  # 600 × 1.2 = 720 → 50ms 단위로 750
-        self.assertEqual(slow.tl.info["pace"]["base_ms"], 600)
+        base = S.live_commit_fast_ms
+        want = -(-int(base * S.pace_max_factor) // 50) * 50                                    # 기본 × 1.2를 50ms 단위로 올림
+        self.assertEqual(h._wait(slow, q), want)
+        self.assertEqual(slow.tl.info["pace"]["base_ms"], base)
         learned = h._sess("live")
         learned.pace.note_pause(750)                                                             # 지난번에 0.75초 쉬고 이어 말한 사람
-        self.assertEqual(h._wait(learned, "네 맞아요."), 950)                                    # 750 × 1.25 = 938 → 950 (다음 턴엔 기다린다)
+        want = -(-int(max(base, 750 * S.pace_pause_margin)) // 50) * 50
+        self.assertEqual(h._wait(learned, "네 맞아요."), want)                                   # 750 × 1.25 = 938 → 950 (다음 턴엔 기다린다)
         meas = h._sess("measure")
         meas.turn_voiced_ms = 5000
         self.assertEqual(h._wait(meas, q), S.commit_complete_ms)                                 # 채점(질문 하나): 이전 턴 기록이 없어 그대로 1.0초
@@ -864,6 +867,45 @@ class SlowPlaybackTest(unittest.TestCase):
             self.assertEqual(ss._paced(src), src)                                         # 변환 실패 → 원래 음성
         finally:
             sm.time_stretch = orig
+
+
+class Feedback2Test(unittest.TestCase):
+    """두 번째 피드백 반영: 변환 길이·홀수 바이트, 없는 날짜 만들지 않기, 반품 진행 문의 가드."""
+
+    def test_stretch_length_and_odd_bytes(self):
+        from agent.audio import time_stretch
+        t = np.arange(16000 * 3) / 16000
+        src = (np.sin(2 * np.pi * 200 * t) * 6000).astype(np.int16).tobytes()
+        for sp in (0.85, 0.9):
+            out = time_stretch(src, sp)
+            self.assertEqual(len(out) // 2, int(round(len(src) // 2 / sp)))              # 끝까지 (잘림 없음)
+        odd = time_stretch(src + b"\x01", 0.85)                                          # 홀수 바이트도 오류 없이
+        self.assertEqual(len(odd) % 2, 0)
+
+    def test_no_invented_dates(self):
+        from agent import facts
+        now = datetime(2026, 10, 6, 21, 0)
+        body = {"status": "ok", "data": {"orders": [{"주문번호": "20261006-0094618", "상세주문번호": "20261006-0094618-01",
+                "주문일자": "2026-10-06 19:01:44", "결제일자": "2026-10-06 19:01:50", "제품명": "하루온 위 가드", "옵션": "x",
+                "수량": 1, "결제수단": ["계좌이체"], "결제여부": "T", "배송상태": "상품준비중"}]}}
+        txt = facts.render_tool_result("get_order_info", body, now)
+        self.assertIn("출고예정일은 조회 결과에 없음", txt)
+        self.assertIn("평일 오후 3시 이후 결제", txt)
+        self.assertNotIn("출고 예정 10월", txt)
+        ret = {"status": "ok", "data": {"반품정보": [{"주문번호": "20260915-0067173", "상품명": "하루온 이눌린 배변 가드",
+                                                   "현재상태": "반품처리중[수거전]", "송장번호": "203554713824"}]}}
+        rtxt = facts.render_tool_result("get_return_info", ret, now)
+        self.assertNotIn("9월 15일", rtxt)                                               # 주문번호 앞자리로 주문일을 만들지 않는다
+        self.assertIn("주문일은 반품 조회 결과에 없다", rtxt)
+        self.assertIn("20260915-0067173", rtxt)
+
+    def test_needs_return_lookup(self):
+        from agent.toolflow import needs_return_lookup
+        self.assertTrue(needs_return_lookup("환불은 언제까지 이뤄지나요?", [], True))
+        self.assertFalse(needs_return_lookup("환불은 언제까지 이뤄지나요?", [], False))   # 전화번호 없음
+        self.assertFalse(needs_return_lookup("반품하고 싶어요", [], True))                 # 진행 문의가 아님
+        done = [{"role": "tool_result", "name": "get_return_info", "result": {"status": "ok"}}]
+        self.assertFalse(needs_return_lookup("환불 아직 안 들어왔어요", done, True))       # 이미 조회함
 
 
 if __name__ == "__main__":

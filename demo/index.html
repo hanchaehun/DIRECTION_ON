@@ -164,7 +164,9 @@ function onEvent(e) {
     case "tool.result": log(`  결과 ${e.name} ${e.status} ${e.ms}ms ${JSON.stringify(e.body).slice(0, 120)}`); break;
     case "agent.cancel": stopPlayback(); if (curAgent) curAgent.classList.add("cut"); curAgent = null; log("  끼어들기 → 재생 중단"); break;
     case "handoff": showHandoff(e); break;
-    case "turn.metrics": drawBars(e); break;
+    case "turn.metrics": drawBars(e);
+      if (e.play_speed && e.play_speed < 1) log(`  느린 말투 → 상담원 재생 ${e.play_speed}배, 문장 사이 쉼 ${Math.round(150 / e.play_speed)}ms`);
+      break;
     case "turn.end": curAgent = null; break;
   }
 }

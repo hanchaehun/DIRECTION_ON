@@ -151,13 +151,18 @@ def time_stretch(pcm: bytes, speed: float, rate: int = RATE) -> bytes:
     10초 문장 변환에 약 20ms라 첫 소리 시간에 영향이 없다."""
     if not pcm or abs(speed - 1.0) < 1e-3:
         return pcm
-    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    pcm = pcm[: len(pcm) // 2 * 2]                      # 홀수 바이트는 마지막 1바이트를 버린다 (int16 단위)
+    n_in = len(pcm) // 2
     frame = int(rate * 0.03)
     hop_out = frame // 2
     hop_in = hop_out * speed
     tol = int(rate * 0.01)
-    if len(x) < frame * 3 + tol * 2:
+    if n_in < frame * 3 + tol * 2:
         return pcm
+    # 끝에 0을 덧대 마지막 조각까지 다 쓰고, 결과를 목표 길이(입력 ÷ 속도)로 자른다 (끝 어미 약 40ms 잘림 방지)
+    x = np.concatenate([np.frombuffer(pcm, dtype=np.int16).astype(np.float32),
+                        np.zeros(frame + tol + hop_out, dtype=np.float32)])
+    target_len = int(round(n_in / speed))
     n = int((len(x) - frame - tol - hop_out) / hop_in)
     if n < 2:
         return pcm
@@ -183,5 +188,5 @@ def time_stretch(pcm: bytes, speed: float, rate: int = RATE) -> bytes:
         y[o:o + frame] += x[pos:pos + frame] * win
         w[o:o + frame] += win
         prev = pos
-    y = y / np.where(w > 0.1, w, 1.0)
+    y = (y / np.where(w > 0.1, w, 1.0))[:target_len]
     return np.clip(y, -32768, 32767).astype(np.int16).tobytes()

@@ -620,6 +620,7 @@ class Session:
                 await self._send_turn_end()
             rec = self.tl.dump({"transcript": self.tl.info.get("transcript")}, redact=not self.s.log_text)
             self._live_event("turn.metrics", **rec["ms_after_speech_end"], rule=self.tl.info.get("rule"),
+                             play_speed=self.tl.info.get("play_speed", 1.0), pace=self.tl.info.get("pace"),
                              counts=rec["counts"], marks=rec["marks"])
             self._live_event("debug.history", history=self.history)
 
@@ -861,6 +862,14 @@ class Session:
                     decision = await self._decide(msgs, s.reasoning_effort)
                     continue
             if (decision.kind == "answer" and not guard_used and rounds == 0 and not failed_before
+                    and toolflow.needs_return_lookup(self.turn_customer, self.history, bool(self.ctx_ids.get("phones")))):
+                # 반품·환불 진행 문의인데 조회 없이 답하려 함 → 반품 조회부터 하게 한 번 되돌린다 (실측 P0031-02)
+                guard_used = True
+                self.tl.event("guard", why="반품 진행 문의에 조회 없이 답함")
+                msgs += [decision.assistant_msg, {"role": "system", "content": toolflow.RETURN_NOTE}]
+                decision = await self._decide(msgs, s.reasoning_effort)
+                continue
+            if (decision.kind == "answer" and not guard_used and rounds == 0 and not failed_before
                     and (self.ctx_ids.get("caller_phone") or self.ctx_ids.get("orders"))
                     and toolflow.asks_for_number(decision.text)):
                 # 발신자 번호·이전 대화 주문번호가 있는데 번호를 다시 물으려 함 → 조회부터 하게 한 번 되돌린다 (실측 P0010-11)
@@ -1043,7 +1052,9 @@ class Session:
                 gap = comma_gap if utext.endswith(",") else sent_gap     # 쉼표에서 나눈 조각 뒤는 짧게 쉰다
                 await self._drain()
                 if kind == "clip":
-                    await self._speak(utext, payload + (gap if i < len(units) - 1 else b""), mark_answer=after_tool)
+                    # _speak이 음성과 뒤의 쉼을 함께 느리게 하므로 여기서는 원래 길이의 쉼을 붙인다 (이중으로 늘지 않게)
+                    raw_gap = silence(s.comma_gap_ms if utext.endswith(",") else s.sentence_gap_ms)
+                    await self._speak(utext, payload + (raw_gap if i < len(units) - 1 else b""), mark_answer=after_tool)
                     spoke += 1
                     continue
                 job: TTSJob = payload

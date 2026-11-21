@@ -115,6 +115,14 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
                 llm_calls += 1
                 continue
         if (d.kind == "answer" and not guard_used and rounds == 0 and not failed_before
+                and toolflow.needs_return_lookup(text, hist, bool(ctx.get("phones")))):
+            guard_used = True
+            out["notes"].append("반품 진행 문의에 조회 없이 답함 → 다시 판단")
+            msgs = msgs + [d.assistant_msg, {"role": "system", "content": toolflow.RETURN_NOTE}]
+            d = await brain.decide(msgs, tools, effort)
+            llm_calls += 1
+            continue
+        if (d.kind == "answer" and not guard_used and rounds == 0 and not failed_before
                 and (ctx.get("caller_phone") or ctx.get("orders")) and toolflow.asks_for_number(d.text)):
             guard_used = True
             out["notes"].append("번호가 있는데 다시 물음 → 다시 판단")

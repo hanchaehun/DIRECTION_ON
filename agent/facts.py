@@ -265,8 +265,13 @@ def render_tool_result(name: str, body, now: datetime) -> str:
                 ed = _dt(o.get("출고예정일자"))
                 bits.append(f"출고예정일 {kdate(ed, now) if ed else o.get('출고예정일자')}")
             elif st in ("상품준비중", "배송준비중") and od and o.get("결제여부") == "T":
-                sd = ship_day(pd or od)
-                bits.append(f"출고 예정 {kdate(sd, now)} (평일 오후 3시 이전 결제는 당일, 이후와 주말은 다음 영업일 출고. 받으시기까지 출고 후 영업일 2~3일)")
+                # 조회 결과에 출고예정일이 없으면 날짜를 만들지 않는다 (실측 P0106-02: 계산한 날짜를 '단정'으로 판정받음).
+                # 대신 결제 시각이 출고 기준(평일 오후 3시)의 어느 쪽인지 알려 준다 ('오후 3시 이후 결제인데 당일 출고' 오류 방지)
+                paid = pd or od
+                side = ("주말 결제" if paid.weekday() >= 5 else
+                        ("평일 오후 3시 이전 결제" if paid.hour < 15 else "평일 오후 3시 이후 결제"))
+                bits.append(f"출고예정일은 조회 결과에 없음 (결제 {kdate(paid, now)} {paid:%H:%M}, {side}. "
+                            "정책: 평일 오후 3시 이전 결제는 당일 출고, 이후와 주말은 다음 영업일 출고. 받으시기까지 출고 후 영업일 2~3일)")
             if dd:
                 n = (now.date() - dd.date()).days
                 ok = "반품 가능 기간(수령 후 10일) 이내" if n <= 10 else "수령 후 10일이 지나 단순 변심·효과 불만족 반품 불가"
@@ -279,12 +284,11 @@ def render_tool_result(name: str, body, now: datetime) -> str:
         rows = data.get("반품정보") or []
         if status == "ok" and not rows:
             lines.append("조회된 반품 건이 없다.")
+        if rows:
+            lines.append("주문일은 반품 조회 결과에 없다. 주문번호 앞자리로 주문 날짜를 말하지 않는다.")
         for i, r in enumerate(rows, 1):
+            # 주문번호 앞자리로 주문일을 만들지 않는다 (실측 P0189-01: '조회 결과에 없는 주문일을 지어냈다'로 판정)
             bits = [f"{i}) 주문번호 {r.get('주문번호')}"]
-            m = _ORDER_RE.match(str(r.get("주문번호") or ""))
-            od = _dt(f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:8]}") if m else None
-            if od:
-                bits.append(f"주문일 {kdate(od, now)}")
             bits.append(f"상품 {clean_product(r.get('상품명'))}")
             bits.append(f"현재상태 {r.get('현재상태')}")
             for k in ("송장번호", "접수일자", "회수일자", "환불일자", "환불금액"):
