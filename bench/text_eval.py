@@ -30,6 +30,7 @@ from agent import aftertool, facts, knowledge  # noqa: E402
 from agent.brain import Brain, OpenAIBackend, parse_now  # noqa: E402
 from agent.clips import ClipBank, load_phrases  # noqa: E402
 from agent.config import RUNTIME, Settings, env  # noqa: E402
+from agent import directlib  # noqa: E402
 from agent.router import Router, choose_bank, choose_opener  # noqa: E402
 from agent.session import normalize_history  # noqa: E402
 from agent.toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls, reask_for  # noqa: E402
@@ -76,6 +77,10 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
 
     guard_used = False
     while True:
+        if d.kind == "answer" and d.text:
+            if rounds == 0 and directlib.has_mark(d.text):
+                out["direct_pick"] = d.text.split("]", 1)[0] + "]"
+            d.text = directlib.expand(d.text, allow=(rounds == 0))
         if d.kind == "answer" and not guard_used and claims_lookup_without_evidence(d.text, evid):
             guard_used = True
             out["notes"].append("조회 없이 확인했다고 답하려 함 → 다시 판단")
@@ -83,6 +88,17 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
             d = await brain.decide(msgs, tools, effort)
             llm_calls += 1
             continue
+        if d.kind == "answer" and not guard_used:
+            cust = [str(h.get("text") or "") for h in hist if h.get("role") == "customer"] + [text]
+            bad = directlib.violations(facts.split_sentences(d.text), cust)
+            if bad:
+                guard_used = True
+                out["notes"].append("첫 문장 후보 조건 위반 → 다시 판단")
+                note = "(시스템: " + " ".join(o.note for o in bad) + " 그 문장을 쓰지 말고 다시 답한다.)"
+                msgs = msgs + [d.assistant_msg, {"role": "system", "content": note}]
+                d = await brain.decide(msgs, tools, effort)
+                llm_calls += 1
+                continue
         if not (d.kind == "tool" and rounds < s.max_tool_rounds):
             break
         runs = await execute_calls(d.tool_calls, ctx, call_fn, s, now)
@@ -121,6 +137,9 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
     out.update(path="llm", answer=ans, said=(opener + " " + ans).strip(), llm_calls=llm_calls,
                bank_sentences=sum(1 for x in facts.split_sentences(ans) if clips.match_text(x) is not None),
                sentences=len(facts.split_sentences(ans)))
+    first = (facts.split_sentences(ans) or [""])[0]
+    out["first_bank"] = clips.match_text(first) is not None if d.kind == "answer" else None
+    out["direct"] = rounds == 0
     return out
 
 

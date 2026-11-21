@@ -66,6 +66,11 @@ class Settings:
     spec_measure: bool = False           # 측정 모드에서는 끈다 (첫 소리는 미리 합성한 음성이라 점수에 영향 없음, 호출만 는다)
     tts_unit_chars: int = 70             # 한 번에 합성하는 글자 수 상한 (긴 문장은 TTS가 7초를 넘긴 실측)
     sentence_gap_ms: int = 150           # 문장 사이 숨
+    first_unit_chars: int = 24           # 첫 합성 단위 목표 길이. 첫 문장이 길면 쉼표에서 앞부분만 먼저 합성한다 (TTS 시간은 글자 수에 비례)
+    first_unit_min_chars: int = 8        # 쉼표로 나눌 때 앞부분 최소 길이
+    comma_gap_ms: int = 80               # 쉼표로 나눈 두 조각 사이 숨
+    direct_openers: bool = False         # 직접 답 첫 문장 후보([D번호])를 프롬프트에 넣는다. 실측 16문항에서 LLM이 한 번도 고르지 않아 끔
+    early_tts: bool = True               # LLM 답이 스트리밍되는 동안 첫 문장 합성을 미리 시작 (최종 답과 글이 같을 때만 쓴다)
     # ── 판정 모델 Jev (운영진 허용, 0.4~0.6초) ──
     use_router: bool = True              # 말 끝·의도 판정에 Jev 사용
     jev_model: str = "jev-1.14.0"          # 고정: 게이트웨이 jev-latest는 1.13, 직접 호출은 1.14로 연결돼 판정이 달랐다

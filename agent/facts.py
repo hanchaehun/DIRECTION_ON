@@ -321,6 +321,25 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENT.findall(t) if s.strip()]
 
 
+def short_head(sent: str, target: int = 24, min_chars: int = 8) -> tuple[str, str]:
+    """첫 문장이 길면 '쉼표 + 공백' 자리에서 앞부분을 떼어 먼저 합성한다. (앞부분, 나머지). 나눌 곳이 없으면 (sent, '').
+    숫자 속 쉼표('3,000원')는 공백이 없어 나누지 않는다. 너무 짧은 조각을 만들지 않는다."""
+    sent = (sent or "").strip()
+    if len(sent) <= target + 8:
+        return sent, ""
+    best, best_d = None, None
+    for m in re.finditer(r",\s+", sent):
+        head, rest = sent[:m.start() + 1].strip(), sent[m.end():].strip()
+        if len(head) < min_chars or len(rest) < 6 or len(head) > int(target * 1.5):
+            continue
+        if re.search(r"\d$", head[:-1]) and re.match(r"\d", rest):
+            continue                                  # '1, 2개'처럼 숫자 나열 사이
+        d = abs(len(head) - target)
+        if best_d is None or d < best_d:
+            best, best_d = (head, rest), d
+    return best if best else (sent, "")
+
+
 def allowed_dates(evidence: str, now: datetime) -> set[tuple[int, int]]:
     out = {(m.group(2), m.group(3)) for m in re.finditer(r"(\d{4})-(\d{1,2})-(\d{1,2})", evidence)}
     al = {(int(a), int(b)) for a, b in out}

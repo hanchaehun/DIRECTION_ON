@@ -36,13 +36,27 @@ def is_handoff_tool(name: str) -> bool:
     return bool(_HANDOFF.search(name))
 
 
-def all_fixed_sentences(phrases: dict, with_products: bool = True) -> list[str]:
+_NEG = re.compile(r"(안|못|않|없|불가|어렵|아니|금지|말아)")
+
+
+def same_facts(a: str, b: str) -> bool:
+    """거의 같은 두 문장이 사실까지 같은가: 숫자와 부정 표현이 모두 같아야 한다.
+    (예: '5만 원 이상'과 '4만 원 이상', '드셔도 됩니다'와 '드시면 안 됩니다'는 글자는 비슷해도 다른 말이다)"""
+    if re.sub(r"\D", "", a) != re.sub(r"\D", "", b):
+        return False
+    return sorted(_NEG.findall(a)) == sorted(_NEG.findall(b))
+
+
+def all_fixed_sentences(phrases: dict, with_products: bool = True, with_direct: bool = True) -> list[str]:
     """합성 없이 나가는 문장들: fixed 목록 + 은행 답을 문장으로 나눈 것 + (선택) 제품별 첫 문장."""
     from .facts import split_sentences
     out = list(phrases.get("fixed", []))
     for k, v in (phrases.get("bank") or {}).items():
         if not k.startswith("_"):
             out += split_sentences(v)
+    if with_direct:
+        from .directlib import sentences as direct_sentences
+        out += direct_sentences()         # 직접 답의 첫 문장 후보 (미리 합성. LLM이 글자 그대로 쓰면 바로 나간다)
     if with_products:
         from .aftertool import product_openers
         out += product_openers()
@@ -111,7 +125,7 @@ class ClipBank:
             import difflib
             best, score = None, 0.0
             for k, v in self.fixed.items():
-                if abs(len(k) - len(n)) > 6:
+                if abs(len(k) - len(n)) > 6 or not same_facts(n, k):
                     continue
                 r = difflib.SequenceMatcher(None, n, k).ratio()
                 if r > score:

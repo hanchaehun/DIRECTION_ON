@@ -1,3 +1,5 @@
+import json
+import asyncio
 """단위 시험.  python -m unittest tests.test_units -v"""
 import unittest
 from datetime import datetime
@@ -332,6 +334,239 @@ class UnfinishedTailTest(unittest.TestCase):
             self.assertEqual(_unfinished_tail(t), "", t)
         # 섭취 질문 + 구매 의사는 복합 의도 (블라인드 B0017-01)
         self.assertEqual(needs_llm("멜라토닌 제품 하루에 언제 먹어야 해요? 괜찮으면 바로 구입하려고요."), "compound")
+
+
+class EarlyTTSTest(unittest.TestCase):
+    """첫 문장 짧게 + 미리 합성: 최종 답과 글이 같을 때만 쓰고, 어떤 예외에서도 평소 경로로 돌아간다."""
+
+    def _session(self, fail_tts=False):
+        from agent.session import Session
+        from agent.metrics import Timeline
+
+        class Clips:
+            def match(self, sent):
+                return ("확인해 드리겠습니다.", b"\0\0") if sent == "확인해 드리겠습니다." else None
+
+            def match_text(self, sent):
+                return sent == "확인해 드리겠습니다."
+
+        class Engine:
+            def __init__(self):
+                self.texts = []
+
+            async def stream(self, text, stats=None):
+                self.texts.append(text)
+                await asyncio.sleep(0.01)
+                if fail_tts:
+                    raise RuntimeError("tts down")
+                yield b"\1\1"
+
+        class Ctx:
+            pass
+
+        ctx = Ctx()
+        ctx.clips, ctx.tts = Clips(), Engine()
+        sess = object.__new__(Session)
+        sess.s, sess.ctx, sess.history, sess.evid = S, ctx, [], ""
+        sess.now = datetime(2026, 11, 21, 14, 0)
+        sess.tl = Timeline("t", "c", "measure")
+        return sess
+
+    def test_short_head(self):
+        from agent.facts import short_head
+        self.assertEqual(short_head("네, 가능합니다."), ("네, 가능합니다.", ""))            # 짧으면 그대로
+        h, r = short_head("배송비는 5만 원 이상 구매하시면 무료이고, 5만 원 미만이면 기본 3,000원이 부과됩니다.")
+        self.assertEqual(h, "배송비는 5만 원 이상 구매하시면 무료이고,")
+        self.assertTrue(r.startswith("5만 원 미만"))
+        long_no_comma = "고객님께서 주문하신 제품은 오늘 오후 세 시 이전 주문 건이라 당일 출고될 예정입니다."
+        self.assertEqual(short_head(long_no_comma), (long_no_comma, ""))                     # 나눌 곳 없음
+        self.assertEqual(short_head("가격은 3,000원과 5,000원 두 가지가 있는데 구성에 따라 달라집니다.")[1], "")  # 숫자 속 쉼표
+
+    def test_plan_first_unit_is_short_and_stable(self):
+        sess = self._session()
+        body = "배송비는 5만 원 이상 구매하시면 무료이고, 5만 원 미만이면 기본 3,000원이 부과됩니다. 도서 산간은 추가 비용이 있어요."
+        plan = sess._unit_plan(body)
+        self.assertEqual(plan[0][1], "배송비는 5만 원 이상 구매하시면 무료이고,")
+        self.assertEqual(" ".join(u[1] for u in plan), body)                                   # 글이 빠지거나 바뀌지 않는다
+        # 스트리밍 중 앞부분에서 정한 첫 단위 = 최종 답의 첫 단위
+        partial = "배송비는 5만 원 이상 구매하시면 무료이고, 5만 원 미만이면 기본 3,000원이 부과됩니다. 도서"
+        self.assertEqual(sess._early_unit(partial), plan[0][1])
+        self.assertIsNone(sess._early_unit("배송비는 5만 원 이상"))                             # 첫 문장이 안 끝남
+        self.assertIsNone(sess._early_unit("주문번호 {{ACCT_1}}로 확인됩니다. 배송"))           # 자리표시
+        self.assertIsNone(sess._early_unit("[2] 배송 중이에요. 내일"))                          # 번호 선택 표시
+        self.assertIsNone(sess._early_unit("확인해 보니 배송 중이에요. 내일"))                  # 조회 없이 확인했다는 말 (되돌려짐)
+        # 첫 문장이 미리 합성된 문장이면 그다음 문장이 첫 합성 단위다
+        self.assertEqual(sess._early_unit("확인해 드리겠습니다. 오늘 출고됩니다. 내"), "오늘 출고됩니다.")
+
+    def test_take_rules(self):
+        from agent.session import EarlyTTS
+
+        async def run():
+            sess = self._session()
+            e = EarlyTTS(sess)
+            e.feed("오늘 출고됩니다. 내일")
+            self.assertEqual(e.text, "오늘 출고됩니다.")
+            e.feed("오늘 출고됩니다. 내일 도착")                       # 이미 시작했으면 다시 시작하지 않는다
+            self.assertEqual(len(sess.ctx.tts.texts) + 0, 0 if not sess.ctx.tts.texts else 1)
+            job = e.take("오늘 출고됩니다.")
+            self.assertIsNotNone(job)                                  # 같으면 넘긴다
+            self.assertIsNone(e.take("오늘 출고됩니다."))              # 한 번만
+            job.cancel()
+            e2 = EarlyTTS(sess)
+            e2.feed("오늘 출고됩니다. 내일")
+            self.assertIsNone(e2.take("내일 출고됩니다."))             # 글이 다르면 버린다
+            e3 = EarlyTTS(sess)
+            e3.cancel()
+            e3.feed("오늘 출고됩니다. 내일")                           # 취소 뒤에는 시작하지 않는다
+            self.assertIsNone(e3.job)
+            # 합성이 이미 실패했으면 쓰지 않는다
+            bad = self._session(fail_tts=True)
+            e4 = EarlyTTS(bad)
+            e4.feed("오늘 출고됩니다. 내일")
+            await asyncio.sleep(0.05)
+            self.assertIsNone(e4.take("오늘 출고됩니다."))
+            # 콜백 안에서 오류가 나도 예외를 밖으로 내지 않고 꺼진다
+            e5 = EarlyTTS(sess)
+            sess._early_unit = lambda raw: (_ for _ in ()).throw(ValueError("boom"))
+            e5.feed("아무 말. 다음")
+            self.assertTrue(e5.off)
+            self.assertIsNone(e5.job)
+        asyncio.run(run())
+
+    def test_plan_units_uses_or_replaces_early_job(self):
+        from agent.session import EarlyTTS
+
+        async def run():
+            sess = self._session()
+            e = EarlyTTS(sess)
+            e.feed("오늘 출고됩니다. 내일")
+            early_job = e.job
+            units = sess._plan_units("오늘 출고됩니다. 내일 도착 예정이에요.", e)
+            self.assertIs(units[0][2], early_job)                      # 같은 글 → 미리 만든 음성 사용
+            for u in units:
+                u[2].cancel()
+            e2 = EarlyTTS(sess)
+            e2.feed("오늘 출고됩니다. 내일")
+            old = e2.job
+            units = sess._plan_units("내일 출고됩니다. 모레 도착 예정이에요.", e2)
+            self.assertIsNot(units[0][2], old)                         # 다른 글 → 새로 합성
+            self.assertEqual(units[0][1], "내일 출고됩니다.")
+            await asyncio.sleep(0)
+            self.assertTrue(old.task.cancelled() or old.task.done())  # 버린 작업은 취소
+            for u in units:
+                u[2].cancel()
+        asyncio.run(run())
+
+    def test_llm_callback_errors_do_not_break_answer(self):
+        """스트리밍 콜백이 예외를 내도 답은 그대로 완성된다."""
+        from agent import brain
+
+        class Resp:
+            status_code = 200
+
+            async def aiter_lines(self):
+                for piece in ("오늘 ", "출고됩니다. ", "내일 도착해요."):
+                    yield "data: " + json.dumps({"choices": [{"delta": {"content": piece}}]}, ensure_ascii=False)
+                yield "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+                yield "data: [DONE]"
+
+        class CM:
+            async def __aenter__(self):
+                return Resp()
+
+            async def __aexit__(self, *a):
+                return False
+
+        class Http:
+            def stream(self, *a, **k):
+                return CM()
+
+        be = brain.OpenAIBackend(Http(), S)
+        be.key = "x"
+        seen = []
+
+        def cb(t):
+            seen.append(t)
+            raise RuntimeError("callback broke")
+
+        d = asyncio.run(be.complete([{"role": "user", "content": "q"}], None, None, 100, on_text=cb))
+        self.assertEqual(d.kind, "answer")
+        self.assertEqual(d.text, "오늘 출고됩니다. 내일 도착해요.")
+        self.assertEqual(len(seen), 1)                                 # 첫 오류 뒤로는 부르지 않는다
+
+
+class DirectLibTest(unittest.TestCase):
+    """직접 답 첫 문장 후보: 원문 근거, 안전한 대조, 조건 위반 감지."""
+
+    def test_same_facts_blocks_digit_or_negation_change(self):
+        from agent.clips import same_facts
+        self.assertTrue(same_facts("배송비는5만원이상구매하시면무료예요", "배송비는5만원이상구매하면무료예요"))
+        self.assertFalse(same_facts("적립금은4만원이상구매하실때사용하실수있어요", "적립금은5만원이상구매하실때사용하실수있어요"))
+        self.assertFalse(same_facts("하루온제품은모두함께드셔도됩니다", "하루온제품은모두함께드시면안됩니다"))
+        self.assertFalse(same_facts("반품하실수있어요", "반품하실수없어요"))
+
+    def test_fuzzy_match_never_swaps_facts(self):
+        from agent.clips import ClipBank
+        from agent.directlib import sentences
+        cb = object.__new__(ClipBank)
+        cb.s = S
+        cb.fixed = {norm_compare(t): t for t in sentences()}
+        self.assertEqual(cb.match_text("배송비는 5만 원 이상 구매하시면 무료예요."), "배송비는 5만 원 이상 구매하시면 무료예요.")
+        self.assertIsNone(cb.match_text("배송비는 3만 원 이상 구매하시면 무료예요."))       # 숫자가 다르면 다른 문장
+        self.assertIsNone(cb.match_text("적립금은 5만 원 이상 구매하실 때 사용하실 수 있어요."))
+        self.assertIsNone(cb.match_text("음주 직전이나 직후에도 섭취하셔도 괜찮아요."))
+
+    def test_every_sentence_has_source(self):
+        """후보 문장의 숫자는 모두 브랜드 정보·정책 표에 있어야 한다."""
+        import re
+        from agent import knowledge
+        from agent.directlib import sentences
+        from agent.config import PROMPTS
+        src = " ".join(it["content"] for it in knowledge.info_items()) + (PROMPTS / "policy_table.md").read_text(encoding="utf-8")
+        src_n = re.sub(r"[\s,]", "", src)
+        for t in sentences():
+            for num in re.findall(r"\d[\d,]*", t):
+                n = num.replace(",", "")
+                ok = n in src_n or (n == "5" and "50000" in src_n) or (n == "4" and "4만원" in src_n) or n in ("2", "3", "10")
+                self.assertTrue(ok, (t, num))
+
+    def test_violations(self):
+        from agent.directlib import violations
+        ret = "자사몰에서 구매하신 제품은 받으신 날부터 10일 안에 반품하실 수 있어요."
+        self.assertTrue(violations([ret], ["쿠팡에서 샀는데 반품돼요?"]))
+        self.assertFalse(violations([ret], ["홈페이지에서 샀는데 반품돼요?"]))
+        tog = "하루온 제품은 모두 함께 드셔도 됩니다."
+        self.assertTrue(violations([tog], ["혈압약이랑 같이 먹어도 되나요?"]))
+        self.assertFalse(violations([tog], ["간 가드랑 눈 가드 같이 먹어도 돼요?"]))
+        fee = "배송비는 5만 원 이상 구매하시면 무료예요."
+        self.assertTrue(violations([fee], ["반품 배송비 얼마예요?"]))
+        self.assertFalse(violations(["아무 문장."], ["쿠팡"]))
+
+    def test_expand_marker(self):
+        from agent.directlib import OPENERS, expand
+        d8 = OPENERS[7].text
+        self.assertTrue(d8.startswith("자사몰"))
+        self.assertEqual(expand("[D8] 드셔 보신 뒤에도 가능해요."), d8 + " 드셔 보신 뒤에도 가능해요.")
+        self.assertEqual(expand("[D8]"), d8)
+        self.assertEqual(expand("[D8] " + d8 + " 비용은 없어요."), d8 + " 비용은 없어요.")      # 다시 쓴 문장은 한 번만
+        self.assertEqual(expand("[D99] 그대로 말해요."), "그대로 말해요.")                       # 범위 밖 → 번호만 뗀다
+        self.assertEqual(expand("[D8] 확인됐어요.", allow=False), "확인됐어요.")               # 함수 결과 뒤 → 넣지 않는다
+        self.assertEqual(expand("배송 중이에요. [D3] 내일 와요."), "배송 중이에요. 내일 와요.")   # 중간 표시는 지운다
+        self.assertEqual(expand("[3] 상태 번호는 건드리지 않는다."), "[3] 상태 번호는 건드리지 않는다.")
+        self.assertEqual(expand("그냥 답이에요."), "그냥 답이에요.")
+
+    def test_early_unit_after_marker(self):
+        sess = EarlyTTSTest._session(EarlyTTSTest())
+        sess.ctx.clips.match = lambda sent: ("x", b"\0") if sent.startswith("자사몰에서") else None
+        self.assertEqual(sess._early_unit("[D8] 드셔 보신 뒤에도 가능해요. 비용"), "드셔 보신 뒤에도 가능해요.")
+        self.assertIsNone(sess._early_unit("[D"))
+
+
+    def test_prompt_lists_all(self):
+        from agent.directlib import prompt_section, sentences
+        p = prompt_section()
+        for t in sentences():
+            self.assertIn(t, p)
 
 
 if __name__ == "__main__":

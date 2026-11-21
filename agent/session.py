@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from websockets.exceptions import ConnectionClosed
 
-from . import aftertool, facts, knowledge
+from . import aftertool, directlib, facts, knowledge
 from .audio import BYTES_PER_MS, chunks, rms, silence
 from .brain import Decision, parse_now
 from .clips import tool_kind
@@ -113,6 +113,54 @@ class Spec:
     task: asyncio.Task
     msgs: list
     started: float
+    early: "EarlyTTS | None" = None
+
+
+class EarlyTTS:
+    """LLM 답이 스트리밍되는 동안 첫 합성 단위의 음성을 미리 만든다 (첫마디 뒤 공백 단축).
+
+    안전 장치: 최종 답을 평소처럼 다듬어(서두 정리·길이 제한·날짜 검증) 나눈 첫 단위의 글이 미리 만든 글과
+    한 글자도 다르지 않을 때만 쓴다. 다르거나, 함수 호출로 바뀌었거나, 합성이 실패했으면 버리고 평소대로 합성한다.
+    어떤 오류도 답을 막지 않는다 (콜백 예외는 이 객체를 끄기만 한다)."""
+
+    def __init__(self, sess: "Session"):
+        self.sess = sess
+        self.text = ""
+        self.job: TTSJob | None = None
+        self.off = False
+
+    def feed(self, raw: str) -> None:
+        if self.off or self.job is not None:
+            return
+        try:
+            t = self.sess._early_unit(raw)
+            if t:
+                self.text = t
+                self.job = TTSJob(self.sess.ctx.tts, for_tts(t, self.sess.s, self.sess.now))
+                self.sess.tl.count("early_tts")
+        except Exception:
+            log.exception("미리 합성 시작 실패 (이번 답은 평소대로)")
+            self.off = True
+            self.cancel()
+
+    def take(self, text: str) -> TTSJob | None:
+        """최종 첫 단위 글과 같으면 미리 만든 작업을 넘긴다 (한 번만). 아니면 버린다."""
+        job, self.job = self.job, None
+        if job is None:
+            return None
+        failed = job.task.done() and job.error is not None
+        if text != self.text or failed:
+            job.cancel()
+            self.sess.tl.count("early_tts_miss")
+            return None
+        self.sess.tl.count("early_tts_hit")
+        return job
+
+    def cancel(self) -> None:
+        self.off = True                     # 취소 뒤 스트림이 이어져도 새 합성을 시작하지 않는다
+        job, self.job = self.job, None
+        if job is not None:
+            job.cancel()
 
 
 class Session:
@@ -193,6 +241,11 @@ class Session:
             self.last_voiced_audio_ms: float | None = None
             self.last_voiced_wall: float | None = None
         self.voiced_now = False
+        # 지난 턴에 쓰이지 않은 미리 합성은 버린다
+        for old in (getattr(self, "early", None), getattr(getattr(self, "spec", None), "early", None)):
+            if old is not None:
+                old.cancel()
+        self.early: EarlyTTS | None = None
         self.spec: Spec | None = None
         self.routes: dict = {}              # 받아쓰기(정규화) → Jev 판정
         self.route_pending: dict[str, float] = {}   # 받아쓰기 → 판정 요청 시각
@@ -432,9 +485,9 @@ class Session:
                 log.warning("%s 함수 정의를 못 받음, 로컬 정의 사용: %r", self.sid, e)
         return self.ctx.last_tools or knowledge.local_tools() or None
 
-    async def _decide(self, msgs: list, effort: str) -> Decision:
+    async def _decide(self, msgs: list, effort: str, on_text=None) -> Decision:
         try:
-            return await self.ctx.brain.decide(msgs, await self._tools(), effort)
+            return await self.ctx.brain.decide(msgs, await self._tools(), effort, on_text=on_text)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -444,8 +497,9 @@ class Session:
     def _start_spec(self, text: str) -> None:
         self._cancel_spec()
         msgs = self.ctx.brain.build_messages(self.history, text, self.caller, self.now, ctx=self.ctx_ids)
-        task = asyncio.create_task(self._decide(msgs, self.s.reasoning_effort))
-        self.spec = Spec(text, norm_compare(text), task, msgs, perf())
+        early = EarlyTTS(self) if self.s.early_tts else None
+        task = asyncio.create_task(self._decide(msgs, self.s.reasoning_effort, early.feed if early else None))
+        self.spec = Spec(text, norm_compare(text), task, msgs, perf(), early)
         self.tl.mark("spec_first")
         self.tl.count("spec")
 
@@ -453,6 +507,8 @@ class Session:
         sp = getattr(self, "spec", None)
         if sp and not sp.task.done():
             sp.task.cancel()
+        if sp and sp.early:
+            sp.early.cancel()
         self.spec = None
 
     # ───────────────────────── 측정 모드 ─────────────────────────
@@ -605,6 +661,13 @@ class Session:
             self.stt_turn_reset = True
         return final
 
+    def _customer_texts(self) -> list[str]:
+        """이번 통화에서 고객이 한 말 (이번 턴 포함)."""
+        out = [str(h.get("text") or "") for h in self.history if h.get("role") == "customer"]
+        if self.turn_customer and not self.customer_pushed:
+            out.append(self.turn_customer)
+        return out
+
     def _push_customer(self) -> None:
         """이번 턴의 손님 말을 이력에 한 번만 남긴다 (끼어들기로 응답이 취소돼도 남도록 턴 끝에서도 부른다)."""
         if self.turn_customer and not self.customer_pushed:
@@ -648,6 +711,7 @@ class Session:
         sp = self.spec
         if sp and sp.norm == norm_compare(final) and not sp.task.cancelled():
             task, msgs = sp.task, sp.msgs
+            early, sp.early = sp.early, None               # 추측 실행 중 미리 만든 첫 문장 음성도 넘겨받는다
             self.tl.count("spec_hit")
             self.tl.info["spec"] = "hit"
         else:
@@ -655,15 +719,21 @@ class Session:
             self._cancel_spec()
             msgs = self.ctx.brain.build_messages(self.history, final, self.caller, self.now,
                                                  ctx=self.ctx_ids, spoken=self.opener_text)
-            task = asyncio.create_task(self._decide(msgs, s.reasoning_effort))
+            early = EarlyTTS(self) if s.early_tts else None
+            task = asyncio.create_task(self._decide(msgs, s.reasoning_effort, early.feed if early else None))
+        self.early = early                                 # 턴이 바뀔 때 _reset_turn이 버릴 수 있게 남긴다
         self._push_customer()
-        decision = await task
-        self.tl.mark("decision")
-        self.tl.info["decision"] = decision.kind
-        if decision.usage:
-            self.tl.info["usage"] = decision.usage
-        await self._decision_loop(decision, msgs)
-        await self._drain()
+        try:
+            decision = await task
+            self.tl.mark("decision")
+            self.tl.info["decision"] = decision.kind
+            if decision.usage:
+                self.tl.info["usage"] = decision.usage
+            await self._decision_loop(decision, msgs, early)
+            await self._drain()
+        finally:
+            if early is not None:                          # 쓰이지 않은 미리 합성은 버린다 (취소·오류 포함)
+                early.cancel()
 
     async def _call_tool(self, name: str, args: dict) -> dict:
         r = await self.ctx.tools.call(self.tools_url, self.sid, name, args, self.s.tool_timeout_s)
@@ -678,12 +748,15 @@ class Session:
         self._live_event("tool.result", name=name, status=r["status_code"], body=r["body"], ms=ms)
         return {"status_code": r["status_code"], "body": r["body"], "ms": ms}
 
-    async def _decision_loop(self, decision: Decision, msgs: list) -> None:
+    async def _decision_loop(self, decision: Decision, msgs: list, early: EarlyTTS | None = None) -> None:
         """함수 호출이 끝날 때까지 돈 뒤 답을 말한다. 조회 없이 '확인해 보니'라고 답하려 하면 한 번 되돌린다."""
         s = self.s
         msgs = list(msgs)
         rounds, guard_used, after_tool = 0, False, False
         while True:
+            if decision.kind == "answer" and decision.text:
+                # 직접 답의 첫 문장 번호([D번호]) → 미리 합성한 문장. 함수 결과 뒤 답에서는 번호 표시만 지운다
+                decision.text = directlib.expand(decision.text, allow=(rounds == 0))
             if (decision.kind == "answer" and not guard_used
                     and claims_lookup_without_evidence(decision.text, self.evid)):
                 guard_used = True
@@ -691,6 +764,17 @@ class Session:
                 msgs += [decision.assistant_msg, {"role": "system", "content": GUARD_NOTE}]
                 decision = await self._decide(msgs, s.reasoning_effort)
                 continue
+            if decision.kind == "answer" and not guard_used:
+                # 조건이 붙은 첫 문장 후보를 반대 조건에서 쓰려 함 (예: 쿠팡 구매 건에 자사몰 반품 기간) → 한 번 되돌린다
+                bad = directlib.violations(facts.split_sentences(decision.text), self._customer_texts())
+                if bad:
+                    guard_used = True
+                    self.tl.event("guard", why="첫 문장 후보 조건 위반")
+                    self.tl.count("direct_guard")
+                    note = "(시스템: " + " ".join(o.note for o in bad) + " 그 문장을 쓰지 말고 다시 답한다.)"
+                    msgs += [decision.assistant_msg, {"role": "system", "content": note}]
+                    decision = await self._decide(msgs, s.reasoning_effort)
+                    continue
             if not (decision.kind == "tool" and rounds < s.max_tool_rounds):
                 break
             if not self.tools_url:
@@ -740,7 +824,9 @@ class Session:
             if decision.kind == "answer":
                 decision.text = aftertool.expand(decision.text)
         if decision.kind == "answer" and decision.text:
-            await self._answer(decision.text, after_tool=after_tool)
+            # 미리 합성은 첫 판단이 그대로 답이 된 경우만 (함수 호출 뒤 답·되돌린 답은 글이 달라 쓰지 않는다)
+            await self._answer(decision.text, after_tool=after_tool,
+                               early=early if (rounds == 0 and not guard_used) else None)
         else:
             self.tl.info["error"] = decision.error or "tool rounds exceeded"
             log.warning("%s 결정 실패: %s", self.sid, (decision.error or "")[:200])
@@ -763,15 +849,19 @@ class Session:
             return "no", t[m.end():].strip()
         return None, t
 
-    def _plan_units(self, body: str) -> list[tuple]:
-        """답을 문장으로 나눠 은행 문장은 음성 그대로, 나머지는 TTS 단위로 묶는다. TTS는 여기서 모두 동시에 시작한다."""
+    def _unit_plan(self, body: str) -> list[tuple]:
+        """답을 말하는 단위로 나눈다 (합성은 하지 않는다). [("clip", 글, 음성) | ("tts", 글, None)].
+        첫 합성 단위는 첫 문장 하나로 따로 두고, 길면 쉼표에서 앞부분만 떼어 낸다 (TTS 시간은 글자 수에 비례해
+        첫 단위가 짧을수록 답이 빨리 들린다). 첫 단위는 첫 합성 문장에만 달려 있어 뒷부분이 바뀌어도 같다."""
+        s = self.s
         units: list[tuple] = []
         cur = ""
+        first_done = False
 
         def flush():
             nonlocal cur
             if cur.strip():
-                units.append(("tts", cur.strip(), TTSJob(self.ctx.tts, for_tts(cur.strip(), self.s, self.now))))
+                units.append(("tts", cur.strip(), None))
             cur = ""
 
         for sent in facts.split_sentences(body):
@@ -779,8 +869,13 @@ class Session:
             if clip:
                 flush()
                 units.append(("clip", clip[0], clip[1]))
-                self.tl.count("bank_sentence")
-            elif cur and len(cur) + len(sent) > self.s.tts_unit_chars:
+            elif not first_done:
+                first_done = True
+                flush()
+                head, rest = facts.short_head(sent, s.first_unit_chars, s.first_unit_min_chars)
+                units.append(("tts", head, None))
+                cur = rest
+            elif cur and len(cur) + len(sent) > s.tts_unit_chars:
                 flush()
                 cur = sent
             else:
@@ -788,14 +883,52 @@ class Session:
         flush()
         return units
 
-    async def _answer(self, text: str, after_tool: bool = False) -> None:
+    def _early_unit(self, raw: str) -> str | None:
+        """스트리밍 중인 답 앞부분에서 첫 합성 단위 글을 정할 수 있으면 그 글. 최종 답에서 같은 글이 나와야만 쓰인다.
+        첫 문장이 확실히 끝났을 때(뒤에 다음 문장이 시작됨)만 정한다. 자리표시·번호 선택 표시가 섞이면 하지 않는다."""
+        if raw and directlib.has_mark(raw):
+            raw = directlib.expand(raw)          # 첫 문장은 미리 합성한 문장, 둘째 문장부터 미리 합성
+        if not raw or "{" in raw or "[" in raw:
+            return None
+        sents = facts.split_sentences(raw)
+        if len(sents) < 2:
+            return None
+        done = " ".join(sents[:-1])
+        if claims_lookup_without_evidence(done, self.evid):
+            return None                                   # 되돌려질 답이다
+        _, body = self._prepare_answer(done)
+        body, _ = facts.verify_answer(body, self.evid, self.now)
+        for kind, utext, _ in self._unit_plan(body):
+            if kind == "tts":
+                return utext
+        return None
+
+    def _plan_units(self, body: str, early: EarlyTTS | None = None) -> list[tuple]:
+        """말하는 단위마다 TTS를 동시에 시작한다. 첫 합성 단위는 미리 만든 음성이 있고 글이 같으면 그것을 쓴다."""
+        units: list[tuple] = []
+        first_tts = True
+        for kind, utext, payload in self._unit_plan(body):
+            if kind == "clip":
+                units.append((kind, utext, payload))
+                self.tl.count("bank_sentence")
+                continue
+            job = early.take(utext) if (first_tts and early is not None) else None
+            first_tts = False
+            units.append(("tts", utext, job or TTSJob(self.ctx.tts, for_tts(utext, self.s, self.now))))
+        if early is not None:
+            early.cancel()                                # 첫 단위가 합성 단위가 아니었던 경우 등
+        return units
+
+    async def _answer(self, text: str, after_tool: bool = False, early: EarlyTTS | None = None) -> None:
         s = self.s
         prefix, body = self._prepare_answer(text)
         body = facts.clamp_answer(body, s.answer_max_sentences, s.answer_max_chars, is_bank=self.ctx.clips.match_text)
         body, fixes = facts.verify_answer(body, self.evid, self.now)
         if fixes:
             self.tl.event("answer_fixed", fixes=fixes)
-        units = self._plan_units(body) if body else []
+        units = self._plan_units(body, early) if body else []
+        if not body and early is not None:
+            early.cancel()
         self.tl.mark("tts_req")
         if prefix and not (prefix == "yes" and self.filler_sent):     # 이미 "네"를 했으면 다시 하지 않는다
             clip = self.ctx.clips.pick(prefix)
@@ -805,9 +938,10 @@ class Session:
         if self.mode == "live" and _HANDOFF_SAID.search(body):
             self._send_handoff("상담원 연결 안내")
         spoke = 0
-        gap = silence(s.sentence_gap_ms)
+        sent_gap, comma_gap = silence(s.sentence_gap_ms), silence(s.comma_gap_ms)
         try:
             for i, (kind, utext, payload) in enumerate(units):
+                gap = comma_gap if utext.endswith(",") else sent_gap     # 쉼표에서 나눈 조각 뒤는 짧게 쉰다
                 await self._drain()
                 if kind == "clip":
                     await self._speak(utext, payload + (gap if i < len(units) - 1 else b""), mark_answer=after_tool)

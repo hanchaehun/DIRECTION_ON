@@ -101,9 +101,12 @@ def load_static_prompt(s, phrases: dict) -> str:
         if body:
             parts.append(f"# [{title}]\n{body}")
     from .clips import all_fixed_sentences
-    fixed = all_fixed_sentences(phrases, with_products=False)
+    fixed = all_fixed_sentences(phrases, with_products=False, with_direct=getattr(s, "direct_openers", False))
     if fixed:
         parts.append("# 정해진 문구 (이 뜻으로 말할 때는 글자 그대로 쓴다)\n" + "\n".join(f"- {x}" for x in fixed))
+    if getattr(s, "direct_openers", False):
+        from .directlib import prompt_section
+        parts.append(prompt_section())
     if getattr(s, "pii_placeholders", False):
         parts.append(PII_NOTE)
     return "\n\n".join(p for p in parts if p)
@@ -270,14 +273,18 @@ class OpenAIBackend:
                 b["max_tokens"] = v
         return b
 
-    async def complete(self, messages, tools, effort, max_tokens) -> Decision:
+    async def complete(self, messages, tools, effort, max_tokens, on_text=None) -> Decision:
         if not self.key:
             return Decision("error", error="OPENAI_API_KEY 없음")
         pz = Pseudonymizer() if self.s.pii_placeholders else None
         if pz:
             messages = pz.mask_messages(messages)
+        cb = None
+        if on_text is not None:
+            # 스트리밍 중인 답 앞부분을 넘긴다 (자리표시는 되돌려서). 콜백 오류는 답에 영향을 주지 않는다
+            cb = (lambda t: on_text(pz.unmask(t))) if pz else on_text
         for attempt in range(4):
-            d = await self._stream(self._body(messages, tools, effort, max_tokens))
+            d = await self._stream(self._body(messages, tools, effort, max_tokens), cb)
             if d.kind == "error" and d.status == 400:
                 bad = [p for p in self.OPTIONAL if p in d.error and p not in self.drop]
                 if bad:
@@ -300,7 +307,7 @@ class OpenAIBackend:
             d.assistant_msg = pz.unmask(d.assistant_msg)
         return d
 
-    async def _stream(self, body: dict) -> Decision:
+    async def _stream(self, body: dict, on_text=None) -> Decision:
         await LIMITER.acquire()
         d = Decision("error", t_start=time.perf_counter())
         content, calls, usage, finish = "", {}, None, ""
@@ -325,6 +332,12 @@ class OpenAIBackend:
                         if delta.get("content"):
                             d.t_first = d.t_first or time.perf_counter()
                             content += delta["content"]
+                            if on_text is not None and not calls:
+                                try:
+                                    on_text(content)
+                                except Exception:          # 미리 합성은 덤이다. 실패하면 이번 답에서는 끈다
+                                    log.exception("on_text 콜백 실패 (미리 합성 끔)")
+                                    on_text = None
                         for tc in delta.get("tool_calls") or []:
                             d.t_first = d.t_first or time.perf_counter()
                             slot = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
@@ -379,7 +392,7 @@ class FakeBackend:
     def __init__(self, s):
         self.s = s
 
-    async def complete(self, messages, tools, effort, max_tokens) -> Decision:
+    async def complete(self, messages, tools, effort, max_tokens, on_text=None) -> Decision:
         d = Decision("answer", t_start=time.perf_counter())
         is_judge = messages and messages[0].get("content") == JUDGE_SYS
         await asyncio.sleep((self.s.fake_judge_latency_ms if is_judge else self.s.fake_llm_latency_ms) / 1000)
@@ -478,12 +491,12 @@ class Brain:
     def max_tokens(self, effort: str | None) -> int:
         return self.s.max_tokens_none if effort in (None, "", "none") else self.s.max_tokens_reasoning
 
-    async def decide(self, messages, tools, effort: str | None) -> Decision:
+    async def decide(self, messages, tools, effort: str | None, on_text=None) -> Decision:
         self.last_call = time.perf_counter()
         mt = self.max_tokens(effort)
         for attempt in range(2):
             try:
-                d = await asyncio.wait_for(self.backend.complete(messages, tools, effort, mt), self.s.llm_timeout_s)
+                d = await asyncio.wait_for(self.backend.complete(messages, tools, effort, mt, on_text=on_text), self.s.llm_timeout_s)
             except asyncio.TimeoutError:
                 d = Decision("error", error="timeout")
             if d.kind == "error" and d.error == "length" and attempt == 0:
