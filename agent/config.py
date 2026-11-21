@@ -68,7 +68,10 @@ class Settings:
     sentence_gap_ms: int = 150           # 문장 사이 숨
     # ── 판정 모델 Jev (운영진 허용, 0.4~0.6초) ──
     use_router: bool = True              # 말 끝·의도 판정에 Jev 사용
-    jev_model: str = "jev-latest"
+    jev_model: str = "jev-1.14.0"          # 고정: 게이트웨이 jev-latest는 1.13, 직접 호출은 1.14로 연결돼 판정이 달랐다
+    jev_commit_wait_ms: int = 200        # 말 끝 확정 시점에 판정이 오는 중이면 이만큼 더 기다린다 (확정 기준 1.1초 이하일 때만)
+    jev_commit_wait_max_thr_ms: int = 1100
+    router_extra_delay_ms: int = 0       # 시험용: 판정 응답에 지연을 더해 느린 경로를 흉내 낸다 (기본 0)
     jev_timeout_s: float = 1.2
     router_pause_ms: int = 450           # 이만큼 조용하면 Jev를 부른다 (결과는 약 0.5초 뒤)
     route_reuse_ratio: float = 0.88      # 받아쓰기가 이만큼 같으면 앞서 받은 Jev 판정을 그대로 쓴다
@@ -112,7 +115,8 @@ class Settings:
     llm_timeout_s: float = 8.0
     answer_max_sentences: int = 3        # 전화 답변 길이 제한 (코드로 강제)
     answer_max_chars: int = 130
-    gateway_rpm: int = 100               # 게이트웨이 분당 호출 상한 (BAZE 한도 120보다 낮게)
+    gateway_rpm: int = 115               # 게이트웨이 분당 호출 상한 (BAZE 한도 120보다 낮게)
+    gateway_jev_reserve: int = 25        # 그중 Jev 몫으로 떼어 두는 수 (일반 호출은 90건까지)
     pii_placeholders: bool = True        # 게이트웨이 개인정보 필터 대응: 번호를 {{PHONE_n}}로 바꿔 보내고 응답에서 되돌린다
     brand_name: str = "하루온"
 

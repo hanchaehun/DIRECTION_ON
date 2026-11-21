@@ -9,6 +9,7 @@ LLM(약 1.7초)보다 빨라서 말 끝 뒤 1초 안에 결과를 쓸 수 있다
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -115,7 +116,9 @@ class Router:
         self.http, self.s = http, s
         base = env("OPENAI_BASE_URL", "https://api.baze.co/v1/gateway").rstrip("/")
         self.url = env("DECISIONS_URL", base + "/decisions/")
-        self.key = env("BAZE_API_KEY") or env("OPENAI_API_KEY")
+        self.key = env("DECISIONS_API_KEY") or env("BAZE_API_KEY") or env("OPENAI_API_KEY")
+        # 게이트웨이를 거칠 때만 게이트웨이 분당 한도를 함께 센다
+        self.via = "gateway" if self.url.startswith(base) else "custom"
         self.calls = 0
 
     async def classify(self, history: list[dict], text: str, caller: dict | None, timeout: float | None = None) -> Route:
@@ -123,12 +126,14 @@ class Router:
         if not self.key or not text.strip():
             r.error = "no key" if not self.key else "empty"
             return r
-        if not await LIMITER.acquire(optional=True):       # 한도가 찼으면 판정 없이 진행 (키워드·무음 규칙으로)
+        if self.via == "gateway" and not await LIMITER.acquire(optional=True, kind="jev"):   # 떼어 둔 몫까지 찼을 때만 건너뜀
             r.error = "rate-limited (skipped)"
             return r
         t0 = time.perf_counter()
         self.calls += 1
         try:
+            if self.s.router_extra_delay_ms:
+                await asyncio.sleep(self.s.router_extra_delay_ms / 1000)
             resp = await self.http.post(self.url, headers={"Authorization": f"Bearer {self.key}"},
                                         json={"model": self.s.jev_model, "state": build_state(history, text, caller),
                                               "questions": QUESTIONS},
@@ -136,8 +141,8 @@ class Router:
             r.ms = round((time.perf_counter() - t0) * 1000)
             if resp.status_code != 200:
                 r.error = f"HTTP {resp.status_code} {resp.text[:160]}"
-                if resp.status_code == 429:
-                    LIMITER.note_429(2.0)
+                if resp.status_code == 429 and self.via == "gateway":
+                    LIMITER.note_429(2.0)            # 게이트웨이 한도일 때만 다른 게이트웨이 호출도 잠시 멈춘다
                 return r
             a = resp.json().get("answers") or {}
             r.complete = float((a.get("turn_complete") or {}).get("noul", 1.0))

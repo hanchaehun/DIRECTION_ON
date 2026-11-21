@@ -66,8 +66,17 @@ def main() -> int:
     for f in INCLUDE_FILES:
         if (ROOT / f).exists():
             files.append((ROOT / f, f))
+    env_text = None
     if not a.no_env:
-        files.append((env_path, ".env"))
+        # 제출용 .env: 로컬 개발 전용 설정(아래 '로컬 개발 전용' 표시 아래의 줄, DECISIONS_*)은 넣지 않는다 → 제출본은 게이트웨이만 쓴다
+        keep, dev = [], False
+        for ln in env_path.read_text(encoding="utf-8").splitlines():
+            if ln.strip().startswith("# 로컬 개발 전용"):
+                dev = True
+            if dev or ln.split("=", 1)[0].strip().startswith("DECISIONS_"):
+                continue
+            keep.append(ln)
+        env_text = "\n".join(keep).rstrip("\n") + "\n"
     voice = s.gemini_voice if s.tts_backend == "gemini" else "fake"
     cache = ROOT / "runtime" / "tts_cache" / f"{s.tts_backend if s.tts_backend == 'gemini' else 'fake'}_{s.gemini_tts_model}_{voice}"
     n_cache = 0
@@ -78,6 +87,9 @@ def main() -> int:
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for p, arc in files:
             z.write(p, arc)
+        if env_text is not None:
+            z.writestr(".env", env_text)
+            files.append((env_path, ".env"))
     size = out.stat().st_size / 1e6
     print(f"{out}  ({len(files)}개 파일, {size:.1f}MB, 첫마디 캐시 {n_cache}개: {cache.name})")
     return 0

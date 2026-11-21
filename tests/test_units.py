@@ -219,5 +219,22 @@ class FactsTest(unittest.TestCase):
         self.assertEqual(pz.unmask({"buyer_cellphone": "{{PHONE_1}}"})["buyer_cellphone"], "010-4444-5555")
 
 
+class RateLimitTest(unittest.TestCase):
+    """게이트웨이 분당 한도: 일반 호출은 limit-reserve 까지, Jev는 limit 까지."""
+
+    def test_jev_reserve(self):
+        import asyncio
+        from agent.ratelimit import RateLimiter
+
+        async def run():
+            rl = RateLimiter(per_minute=10, reserve=3)
+            got = [await rl.acquire(optional=True) for _ in range(9)]
+            self.assertEqual(sum(got), 7)                               # 일반 호출은 7건에서 막힌다
+            jev = [await rl.acquire(optional=True, kind="jev") for _ in range(5)]
+            self.assertEqual(sum(jev), 3)                               # Jev는 떼어 둔 3건을 더 쓴다
+            self.assertFalse(await rl.acquire(optional=True, kind="jev"))
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -174,7 +174,7 @@ class Session:
         self.voiced_now = False
         self.spec: Spec | None = None
         self.routes: dict = {}              # 받아쓰기(정규화) → Jev 판정
-        self.route_pending: set[str] = set()
+        self.route_pending: dict[str, float] = {}   # 받아쓰기 → 판정 요청 시각
         self.commit_evt = asyncio.Event()
         self.first_sound_sent = False
         self.filler_sent = False
@@ -294,7 +294,7 @@ class Session:
         pause = s.live_router_pause_ms if self.mode == "live" else s.router_pause_ms
         if (s.use_router and norm and quiet and silence_ms >= pause
                 and norm not in self.routes and not self._similar_pending(norm) and self._route_for(text) is None):
-            self.route_pending.add(norm)
+            self.route_pending[norm] = perf()
             asyncio.create_task(self._run_router(text, norm))
         # 추측 실행 (시연 모드): 쉼에서 LLM을 미리 돌려 답까지의 시간을 줄인다. 점수에는 영향이 없어 측정 모드에서는 끈다
         if self._spec_enabled():
@@ -351,7 +351,14 @@ class Session:
             thr, name = s.commit_incomplete_ms, "incomplete"
         else:
             thr, name = s.commit_very_incomplete_ms, "very_incomplete"
-        return name if silence_ms >= thr else None
+        if silence_ms < thr:
+            return None
+        # 확정 시점에 판정이 오는 중이면 조금 더 기다린다: 판정이 있어야 고정 답 바로 응답·첫마디 선택을 할 수 있다
+        # (게이트웨이 경유 판정은 p50 0.46초, 무음 0.45초에 부르면 확정 1.0초 무렵에 도착한다)
+        if (r is None and s.use_router and thr <= s.jev_commit_wait_max_thr_ms and self._similar_pending(norm)
+                and silence_ms < thr + s.jev_commit_wait_ms):
+            return None
+        return name
 
     async def _run_router(self, text: str, norm: str) -> None:
         try:
@@ -360,7 +367,7 @@ class Session:
             log.warning("router failed: %r", e)
             return
         finally:
-            self.route_pending.discard(norm)
+            self.route_pending.pop(norm, None)
         self.routes[norm] = r
         self.tl.count("jev")
         self.tl.event("jev", ok=r.ok, ms=r.ms, complete=round(r.complete, 2), upset=round(r.upset, 2),

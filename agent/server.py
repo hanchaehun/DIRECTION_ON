@@ -40,7 +40,7 @@ class ServerContext:
         self.clips = ClipBank(self.tts, self.phrases, s)
         self.tools = ToolsClient(http)
         self.router = Router(http, s)
-        ratelimit.configure(s.gateway_rpm)
+        ratelimit.configure(s.gateway_rpm, s.gateway_jev_reserve)
         self.last_tools: list | None = knowledge.local_tools() or None   # 첫 세션 전 예열에도 같은 함수 정의를 쓴다
 
     def make_stt(self, session, start: dict):

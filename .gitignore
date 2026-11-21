@@ -7,3 +7,7 @@ data/brand/
 data/mock_db*.json
 data/examples.json
 data/legacy_starter/
+# 로컬 정리용 성능 리포트 (GitHub 업로드 제외)
+latency_benchmark_report.pdf
+latency_benchmark_p1.png
+latency_benchmark_p2.png

@@ -51,7 +51,12 @@ def product_mentioned(query: str) -> bool:
 def reask_kind(name: str, args: dict, blocked: str) -> str:
     """번호가 깨져 들려 막힌 경우 어떤 번호를 다시 물을지. 손님 음성의 숫자가 사람이 들어도 이상한 경우가 있어
     (연습 P0052-02) 무엇을 어떻게 말해 달라는지 구체적으로 묻는다."""
-    if not blocked or "정확" not in blocked:
+    if not blocked:
+        return ""
+    if "번호가 없다" in blocked:
+        # 번호를 말한 적이 없는데 조회하려 했다 → '잘 안 들렸다'가 아니라 평범하게 번호를 여쭌다 (실측 P0026·P0072)
+        return {"get_order_info": "ask_order_or_contact", "get_return_info": "ask_name_phone_return"}.get(name, "")
+    if "정확" not in blocked:
         return ""
     if name in ("request_callback", "get_return_info"):
         return "reask_phone"
@@ -91,6 +96,10 @@ def block_reason(name: str, args: dict, ctx: dict) -> str:
         known = {facts.digits(o) for o in ctx.get("orders", [])}
         if not (facts.valid_order_id(v) or facts.digits(v) in known):
             return "주문번호가 정확하지 않다. 접수하지 않았다. 주문 조회로 주문을 먼저 확인하거나 주문번호를 다시 여쭌다."
+    if name == "get_order_info" and not (facts.digits(args.get("buyer_cellphone")) or facts.digits(args.get("order_id"))):
+        return "주문번호나 전화번호가 없다. 번호가 없다. 조회하지 않았다."
+    if name == "get_return_info" and not facts.digits(args.get("customer_phone_number")):
+        return "전화번호가 없다. 번호가 없다. 조회하지 않았다."
     if name == "get_order_info":
         ph, oid = args.get("buyer_cellphone"), args.get("order_id")
         if not ((ph and facts.valid_phone(ph)) or (oid and facts.valid_order_id(oid))):
