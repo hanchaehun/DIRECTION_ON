@@ -78,6 +78,9 @@ class Settings:
     bank_min_conf: float = 0.9          # 은행 직행에 필요한 의도 확신도
     bank_agree_conf: float = 0.55        # 키워드 후보가 있을 때 Jev가 같은 판단이라고 보는 최소 확신도
     bank_fuzzy_ratio: float = 0.92      # LLM 문장이 은행 문장과 이만큼 같으면 은행 음성으로 말한다
+    faq_direct: bool = True              # 시연용 단문 FAQ 키워드 단독 직행 (안전 조건 통과 시 LLM·TTS 생략)
+    faq_direct_live_only: bool = True    # 기본: 시연 모드(live)에서만 발동 (공식 측정 모드 안전성 보호)
+    faq_max_chars: int = 32              # 단문 FAQ 허용 최대 글자 수 (공백·문장부호 제외)
     upset_min_prob: float = 0.8
     complete_min_prob: float = 0.5       # 이 이상이면 말이 끝난 것으로 본다
     llm_judge: bool = False             # 애매한 끝맺음에 LLM 완결성 판정 (게이트웨이 호출당 마스킹 5크레딧·분당 120건 한도로 기본 끔)

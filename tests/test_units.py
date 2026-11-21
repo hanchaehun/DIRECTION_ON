@@ -255,6 +255,84 @@ class GuardTest(unittest.TestCase):
         for q in ("선박스 효과", "3박스 효과", "효과 있나요", "하루에 몇 알 먹어요", "언제 먹는 게 좋아요", "제품 가격", ""):
             self.assertFalse(product_mentioned(q), q)
 
+    def test_phone_validation_and_example_phone_guard(self):
+        from agent.facts import context_ids, resolve_ids, valid_phone
+        from agent.toolflow import block_reason, reask_kind
+        # 010은 11자리만 통과 (P0193-02 실측 '010-3710-35' 차단)
+        self.assertFalse(valid_phone("010-3710-35"))
+        self.assertFalse(valid_phone("010-3710-351"))
+        self.assertTrue(valid_phone("010-3572-6035"))
+        self.assertTrue(valid_phone("02-1234-5678"))
+        # 프롬프트·예시 번호(policy_table, examples.md) 차단 + reask_phone 유도
+        empty_ctx = {"phones": [], "orders": []}
+        for bad in ("010-1234-5678", "010-4444-5555", "01022223333", "010-3710-35"):
+            blk = block_reason("get_return_info", {"customer_phone_number": bad}, empty_ctx)
+            self.assertTrue(blk, bad)
+            self.assertEqual(reask_kind("get_return_info", {"customer_phone_number": bad}, blk), "reask_phone")
+        # 발신자 번호가 있으면 9자리 010이나 예시 번호도 발신자 번호로 보정된다
+        ctx = context_ids([], {"name": "홍길동", "phone": "01088889999"})
+        out1, _ = resolve_ids("get_return_info", {"customer_phone_number": "010-3710-35"}, ctx)
+        self.assertEqual(out1["customer_phone_number"], "01088889999")
+        out2, _ = resolve_ids("get_order_info", {"buyer_cellphone": "010-1234-5678"}, ctx)
+        self.assertEqual(out2["buyer_cellphone"], "01088889999")
+
+
+class FaqDirectTest(unittest.TestCase):
+    """시연용 단문 FAQ 키워드 직행: 정상 단문만 발동하고, 예외·복합·문맥 문항은 차단한다."""
+
+    def test_true_short_faqs_in_live_mode(self):
+        from agent.router import choose_bank
+        cases = [
+            ("배송비 얼마예요?", "faq_shipping_fee"),
+            ("택배사가 어디예요?", "faq_courier"),
+            ("고객센터 운영시간이 몇 시까지예요?", "faq_hours"),
+            ("적립금은 얼마 이상부터 쓸 수 있어요?", "faq_points"),
+            ("쿠폰 중복 사용 되나요?", "faq_coupon_stack"),
+            ("고등학생이 먹어도 되나요?", "faq_minor"),
+            ("술 마신 날 먹어도 되나요?", "faq_alcohol"),
+            ("하루온 영양제 두 가지 같이 먹어도 되나요?", "faq_together"),
+        ]
+        for text, want in cases:
+            k, why = choose_bank(text, [], None, None, S, mode="live")
+            self.assertEqual((k, why), (want, "faq-keyword"), text)
+            # 기본 설정(faq_direct_live_only=True)에서는 측정 모드에서 발동하지 않는다
+            k_m, _ = choose_bank(text, [], None, None, S, mode="measure")
+            self.assertIsNone(k_m, f"measure mode should not fire for {text}")
+
+    def test_trap_and_context_cases_blocked(self):
+        from agent.router import choose_bank
+        traps = [
+            ("오전에 눈 관련 1개 주문했는데 오후에 간 제품 1개 주문하려는데 배송비 추가 내야 하나요?", []),
+            ("제주도 배송비는 얼마예요?", []),
+            ("반품 배송비가 얼마예요?", []),
+            ("조인플렉스 관절 영양제 주문하고 싶은데 한 박스만 사면 배송비 얼마예요?", []),
+            ("CJ택배 송장 조회가 안 돼요.", []),
+            ("고혈압약이랑 같이 먹어도 괜찮을까요?", []),
+            ("타사 비타민이랑 하루온 같이 먹어도 되나요?", []),
+            ("고등학생 아들이 먹어도 되나요? 그리고 남편은 술 마신 날 먹어도 돼요?", []),
+            ("적립금이랑 할인 쿠폰 같이 쓸 수 있나요? 그리고 적립금은 얼마 이상 써요?", []),
+            ("만료된 쿠폰 복구해 주세요.", []),
+            ("아이가 먹고 두드러기가 났어요.", []),
+            ("배송비 얼마예요?", [{"role": "customer", "text": "주문 취소하려는데"}]),
+            ("배송비 얼마예요? 010-1234-5678 확인해 주세요.", []),
+        ]
+        for text, hist in traps:
+            k, why = choose_bank(text, hist, None, None, S, mode="live")
+            self.assertIsNone(k, f"trap should be blocked: {text} -> {k}({why})")
+
+
+class UnfinishedTailTest(unittest.TestCase):
+    def test_unfinished_tail(self):
+        from agent.session import _unfinished_tail
+        from agent.router import needs_llm
+        for t in ("010 9901.", "20261003-00.", "어제 주문했는데.", "환불 받았고."):
+            self.assertTrue(_unfinished_tail(t), t)
+        for t in ("010-1234-5678.", "20261003-0084222.", "1600-0000.", "Il 600, 000.", "조인플렉스 2개.",
+                  "반품하고 싶은데요.", "배송이 안 왔어요.", "어제 주문한 제품이요."):
+            self.assertEqual(_unfinished_tail(t), "", t)
+        # 섭취 질문 + 구매 의사는 복합 의도 (블라인드 B0017-01)
+        self.assertEqual(needs_llm("멜라토닌 제품 하루에 언제 먹어야 해요? 괜찮으면 바로 구입하려고요."), "compound")
+
 
 if __name__ == "__main__":
     unittest.main()

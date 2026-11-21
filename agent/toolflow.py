@@ -65,7 +65,7 @@ def product_mentioned(query: str) -> bool:
     return False
 
 
-_EXAMPLE_PHONES = {"01012345678", "01000000000", "01011112222", "01012341234"}
+_EXAMPLE_PHONES = facts.EXAMPLE_PHONES
 
 
 def reask_kind(name: str, args: dict, blocked: str) -> str:
@@ -104,8 +104,10 @@ def reask_for(runs: list) -> str:
 def block_reason(name: str, args: dict, ctx: dict) -> str:
     """함수를 실행하면 안 되는 경우. 번호가 깨져 들린 채로 접수·조회하면 틀린 호출이 된다."""
     # 형식 예시 번호를 그대로 넣은 호출 (실측 P0193-02: 번호가 덜 들리자 '010-1234-5678'로 조회함)
+    ctx_phones = {facts.digits(p) for p in ctx.get("phones", [])}
     for k in ("buyer_cellphone", "customer_phone_number", "phone_number"):
-        if facts.digits(args.get(k)) in _EXAMPLE_PHONES:
+        d = facts.digits(args.get(k))
+        if d in _EXAMPLE_PHONES and d not in ctx_phones:
             return "전화번호가 정확히 들리지 않았다. 조회하지 않았다." if name in LOOKUPS else "전화번호가 정확하지 않다. 접수하지 않았다."
     if name == "search_products" and not product_mentioned(args.get("query")):
         return "검색어에 제품명이나 건강 고민이 없다. 검색하지 않았다. 고객에게 어떤 제품을 문의하시는지 여쭌다."

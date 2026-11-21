@@ -74,6 +74,27 @@ _SENT_END = re.compile(r"[.?!。？！]\s*$")
 _VERB_END = re.compile(r"(요|다|까|죠|니다|세요|어|아|해|네|군|지|래|나|가|고|서|데|라|자|게|걸|냐|니)$")
 
 
+_CONNECTIVE_END = re.compile(r"(는데|은데|인데|던데|한데|지만|니까|으면|하면|해서|아서|어서|가지고|는지|거든|"
+                             r"(하|했|되|됐|있|없|왔|갔|샀|받았)고)$")
+_TAIL_DIGITS = re.compile(r"(\d[\d\s\-]*)$")
+
+
+def _unfinished_tail(text: str) -> str:
+    """마침표가 찍혔어도 이어 말할 가능성이 큰 끝. ''이면 해당 없음.
+    - 'partial_number': 번호를 읽다 멈춤 ('010 9901.', '20261003-00.'). 다 읽은 번호는 해당 없음
+    - 'connective': '요' 없이 연결어미로 끝남 ('어제 주문했는데.'). '~는데요.'는 요청을 끝맺는 말로도 흔해 제외"""
+    body = re.sub(r"[.?!。？！\s]+$", "", text.strip())
+    m = _TAIL_DIGITS.search(body)
+    if m:
+        d = re.sub(r"\D", "", m.group(1))
+        if (d.startswith("01") and len(d) < 10) or (re.match(r"0[2-6]", d) and len(d) < 9) \
+                or (d.startswith("20") and 8 <= len(d) < 15):
+            return "partial_number"
+    if _CONNECTIVE_END.search(body):
+        return "connective"
+    return ""
+
+
 def _noun_only(text: str) -> bool:
     """물음표 없이 서술어 없는 명사로 끝난 짧은 말인가 ('대장영양제.', '배송 문의.'). 숫자를 불러 준 말은 제외한다."""
     t = text.strip()
@@ -329,6 +350,11 @@ class Session:
         if t.endswith((",", "，", "…", "-")):
             # 쉼표·말줄임으로 끝남: 이어서 말하는 중이다 (실측 P0130-01: '대장 영양제,' 뒤 1.8초 쉬고 이어 말함)
             thr, name = s.commit_comma_ms, "comma"
+        elif _unfinished_tail(t):
+            # 번호를 읽다 멈췄거나 연결어미로 끝남: Soniox가 마침표를 찍어도 이어 말하는 경우가 많다 (블라인드 감사)
+            # 번호를 읽다 멈춘 경우는 실제로 번호가 깨져 끝난 말(연습 P0095-06, P0193-02)도 있어 조금만 더 기다린다
+            name = _unfinished_tail(t)
+            thr = s.live_commit_mid_ms if live else (s.commit_incomplete_ms if name == "partial_number" else s.commit_noun_ms)
         elif classify(t, "", s) == "preamble":
             # 인사·용건 예고뿐: 뒤에 본론이 이어지는 경우가 많다
             thr, name = s.commit_preamble_ms, "preamble"
@@ -597,7 +623,7 @@ class Session:
         # 1. 첫 소리: 은행 직행 또는 첫마디. 확정 받아쓰기를 기다리지 않는다 (1.5초 안에 나가야 한다)
         bank_clip, opener_kind = None, ""
         if text0.strip():
-            bank_key, why = choose_bank(text0, self.history, self.caller, route, s)
+            bank_key, why = choose_bank(text0, self.history, self.caller, route, s, mode=self.mode)
             bank_clip = self.ctx.clips.bank(bank_key) if bank_key else None
             if bank_clip is not None:
                 self.tl.info.update(decision="bank", bank=bank_key, bank_why=why)

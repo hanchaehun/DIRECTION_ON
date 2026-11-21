@@ -18,6 +18,11 @@ from datetime import datetime, timedelta
 WEEK = "월화수목금토일"
 PHONE_KEYS = ("buyer_cellphone", "customer_phone_number", "phone_number")
 ORDER_KEYS = ("order_id", "order_number")
+# 프롬프트·예시에 등장하는 가짜 예시 번호 (LLM이 번호를 못 들었을 때 그대로 넣어 조회하는 결함 차단)
+EXAMPLE_PHONES = frozenset({
+    "01012345678", "01000000000", "01012341234", "01000001234",
+    "01011112222", "01022223333", "01033334444", "01044445555", "01055556666",
+})
 
 
 def digits(v) -> str:
@@ -48,7 +53,7 @@ def context_ids(history: list[dict], caller: dict | None) -> dict:
     orders: list[str] = []          # 'YYYYMMDD-NNNNNNN'
     items: list[str] = []           # 상세주문번호
     cp = digits((caller or {}).get("phone"))
-    if len(cp) >= 9:
+    if valid_phone(cp):
         phones.append(cp)
     for h in history or []:
         role = h.get("role")
@@ -66,7 +71,7 @@ def context_ids(history: list[dict], caller: dict | None) -> dict:
             if m.group(3):
                 items.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
     uniq = lambda xs: list(dict.fromkeys(xs))
-    return {"phones": uniq(phones), "orders": uniq(orders), "items": uniq(items), "caller_phone": cp if len(cp) >= 9 else ""}
+    return {"phones": uniq(phones), "orders": uniq(orders), "items": uniq(items), "caller_phone": cp if valid_phone(cp) else ""}
 
 
 def _snap(value: str, candidates: list[str], max_dist: int) -> str | None:
@@ -122,9 +127,10 @@ def resolve_ids(name: str, args: dict, ctx: dict, max_phone_dist: int = 3, max_o
         if fixed:
             out["return_items"] = fixed
     cp = ctx.get("caller_phone")
+    ctx_phones = {digits(p) for p in ctx.get("phones", [])}
     if cp and name == "get_order_info":
         ph, oid = digits(out.get("buyer_cellphone")), digits(out.get("order_id"))
-        bad_phone = bool(ph) and not (9 <= len(ph) <= 11 and ph.startswith("0"))
+        bad_phone = bool(ph) and (not valid_phone(ph) or (ph in EXAMPLE_PHONES and ph not in ctx_phones))
         bad_order = bool(oid) and not valid_order_id(out.get("order_id"))
         # 주문번호가 깨져 들렸으면(형식이 안 맞음) 발신자 번호로도 찾을 수 있게 한다. 멀쩡한 주문번호에는 덧붙이지 않는다
         # (다른 번호로 주문했을 수 있다).
@@ -133,7 +139,7 @@ def resolve_ids(name: str, args: dict, ctx: dict, max_phone_dist: int = 3, max_o
             out["buyer_cellphone"] = cp
     if cp and name == "get_return_info":
         ph = digits(out.get("customer_phone_number"))
-        if not (9 <= len(ph) <= 11 and ph.startswith("0")):
+        if not valid_phone(ph) or (ph in EXAMPLE_PHONES and ph not in ctx_phones):
             notes.append(f"customer_phone_number: {out.get('customer_phone_number')} → {cp} (발신자 번호)")
             out["customer_phone_number"] = cp
     return out, notes

@@ -238,7 +238,9 @@ _TOPICS = (
     ("return", re.compile(r"(반품|환불|환풀|교환|취소)")),
     # 제품에 대해 '묻는' 말만 센다. "먹었는데 효과가 없어서 환불"은 반품 사유이지 제품 문의가 아니다
     ("product", re.compile(r"(효과|효능|성분|섭취|복용|먹)[^.?!]{0,10}(어떤|어떻게|알려|궁금|있나요|있을까요|인가요|는지|될까요|되나요|좋나요|좋을까요)"
-                           r"|(어떤|무슨)\s*(효과|효능|성분)")),
+                           r"|(어떤|무슨)\s*(효과|효능|성분)"
+                           # 섭취 시기·방법 질문 (블라인드 B0017-01: '하루에 언제 먹어야 해요? … 구입하려고요')
+                           r"|(언제|어떻게|몇\s*(알|번|포|정|개|봉)|하루에?)\s*\S{0,6}\s*(먹|섭취|복용|드시|드셔)")),
     ("buy", re.compile(r"((구매|구입)|사고\s*싶|살려고|사려고|주문\s*(방법|하려|할려|하고\s*싶|은\s*어떻게))")),
 )
 
@@ -253,10 +255,86 @@ def needs_llm(text: str) -> str:
     return ""
 
 
-def choose_bank(text: str, history: list[dict], caller: dict | None, r: Route | None, s) -> tuple[str | None, str]:
+# ───────────────────────── 시연용 단문 FAQ 키워드 직행 (안전 게이트) ─────────────────────────
+# 함수 없는 일반 FAQ는 LLM+TTS를 거치면 첫마디 뒤 5초 넘게 공백이 생긴다.
+# 시연 모드(mode="live")에서 엄격한 안전 조건을 모두 통과한 단일 단문 FAQ만 미리 합성한 음성으로 바로 답한다.
+_FAQ_CONJ = re.compile(r"(그리고|그런데|근데|또한|추가로|그거\s*말고|말고도)")
+_FAQ_BLOCK = re.compile(
+    r"(주문한|주문했|결제했|결제\s*후|사후|샀는데|시켰는데|받았|보냈|입금했|내\s*주문|제\s*주문|"
+    r"언제\s*(와|오|도착|출고|들어|주나)|합배송|묶음|따로|두\s*건|추가\s*내|도서|산간|제주|"
+    r"반품|환불|환풀|교환|취소|왕복|불량|오배송|누락|못\s*받|안\s*왔|송장|기사|조회|확인|"
+    r"쿠팡|네이버|스마트\s*스토어|11번가|지마켓|옥션|타사|다른\s*(회사|브랜드|쇼핑몰|사이트)|홈쇼핑|"
+    r"처방|병원|지병|질환|혈압약|당뇨약|감기약|영양제\s*말고|약이랑|약과|약\s*먹|임산부|수유|"
+    r"상담원|연결|콜백|전화\s*(주|줘|부탁)|연락\s*(주|줘|부탁)|만료|소멸|복구|오류|안\s*돼|안돼|안\s*되|비싸|광고|탈퇴|할인|얼마짜리)"
+)
+_FAQ_RULES: tuple[tuple[str, re.Pattern, re.Pattern | None], ...] = (
+    ("faq_shipping_fee",
+     re.compile(r"배송비.*(얼마|무료|기준|붙|있나요|인가요|내야|얼마나|어떻게)|(얼마|무료).{0,8}배송비"),
+     re.compile(r"(추가|따로|두\s*개|박스\s*만|한\s*박스|주문\s*하|구입|사고\s*싶)")),
+    ("faq_courier",
+     re.compile(r"(택배사|어느\s*택배|무슨\s*택배|어떤\s*택배|택배\s*(어디|회사|어느))"),
+     None),
+    ("faq_hours",
+     re.compile(r"(고객센터|상담\s*시간|운영\s*시간|업무\s*시간|영업\s*시간|점심\s*시간).{0,14}(몇\s*시|언제|번호|어떻게|알려|인가요|에요|예요|까지|해요|되나요)|"
+                r"(몇\s*시|언제).{0,10}(고객센터|상담|운영|업무|영업)"),
+     None),
+    ("faq_points",
+     re.compile(r"(적립금|포인트).{0,14}(얼마|조건|최소|부터|사용|쓸\s*수)"),
+     re.compile(r"(쿠폰|같이|함께|동시|중복)")),
+    ("faq_coupon_stack",
+     re.compile(r"(쿠폰.{0,12}(중복|같이\s*쓸|함께\s*쓸|동시|적립금)|(중복|동시).{0,10}쿠폰)"),
+     re.compile(r"(발급|어디서|받|카카오|회원가입|기간|며칠)")),
+    ("faq_minor",
+     re.compile(r"(미성년자|고등학생|중학생|청소년|어린이|아이).{0,12}(먹어|섭취|복용|괜찮|되나|돼요)"),
+     re.compile(r"(남편|술|음주|성인|아빠|엄마)")),
+    ("faq_alcohol",
+     re.compile(r"(음주|술\s*(마|먹|드)).{0,14}(먹어|섭취|복용|괜찮|되나|돼요|전후|후에|전에)"),
+     re.compile(r"(고등학생|미성년자|아이|약)")),
+    ("faq_together",
+     re.compile(r"(같이|함께|동시에).{0,10}(먹어|섭취|복용|드셔)"),
+     re.compile(r"(약|처방|병원|술|음주|커피|우유|타사|다른\s*회사|비타민\s*말고|쿠폰|적립금)")),
+)
+
+
+def faq_route(text: str, history: list[dict], caller: dict | None, max_chars: int = 32) -> tuple[str | None, str]:
+    """엄격한 안전 조건을 모두 통과한 단문 단일 FAQ만 은행 키를 반환한다. (bank_key, 사유)"""
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if not t:
+        return None, "empty"
+    if history:
+        return None, "has_history"
+    if has_identifier(t):
+        return None, "has_identifier"
+    compact = re.sub(r"[\s.,!?~…]+", "", t)
+    if len(compact) > max_chars:
+        return None, "too_long"
+    if t.count("?") + t.count("？") >= 2 or _FAQ_CONJ.search(t):
+        return None, "multi_clause"
+    why = needs_llm(t)
+    if why:
+        return None, why
+    if _FAQ_BLOCK.search(t):
+        return None, "blocked_context"
+    hits = []
+    for key, pos, neg in _FAQ_RULES:
+        if pos.search(t) and not (neg and neg.search(t)):
+            hits.append(key)
+    if len(hits) == 1:
+        # faq_together는 하루온 제품·영양제 문맥이 함께 있을 때만 발동 (모호한 "같이 먹어도 돼요?" 방지)
+        if hits[0] == "faq_together" and not re.search(r"(하루온|제품|영양제|가드|두\s*가지|여러|맥스|이눌린|조인플렉스)", t):
+            return None, "ambiguous_together"
+        return hits[0], "faq_hit"
+    if len(hits) > 1:
+        return None, "multi_faq"
+    return None, "no_match"
+
+
+def choose_bank(text: str, history: list[dict], caller: dict | None, r: Route | None, s,
+                *, mode: str = "measure") -> tuple[str | None, str]:
     """(은행 답 키 또는 None, 근거). 고정 답은 틀리면 안 되므로 보수적으로 낸다.
     - 인사만 한 경우: 키워드만으로 낸다.
     - 용건이 둘 이상이거나 섭취 후 이상 증상을 말하면 내지 않는다 → LLM.
+    - 시연 모드(또는 faq_direct_live_only=False)에서 안전 조건을 모두 통과한 단문 FAQ는 키워드로 바로 낸다.
     - Jev 확신도가 높으면(bank_min_conf 이상) Jev 단독으로 낸다.
     - 키워드 후보가 있고 Jev도 같은 계열로 판단하면 낸다.
     - Jev 결과가 없으면(시간 초과) 내지 않는다 → LLM."""
@@ -266,6 +344,10 @@ def choose_bank(text: str, history: list[dict], caller: dict | None, r: Route | 
     why = needs_llm(text)
     if why:
         return None, why
+    if getattr(s, "faq_direct", False) and (not getattr(s, "faq_direct_live_only", True) or mode == "live"):
+        fk, _ = faq_route(text, history, caller, max_chars=getattr(s, "faq_max_chars", 32))
+        if fk:
+            return fk, "faq-keyword"
     if r is None or not r.ok:
         return None, "no-jev"
     jv_hi = decide_bank(r, text, history, caller, s)
