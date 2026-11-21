@@ -258,7 +258,8 @@ def render_tool_result(name: str, body, now: datetime) -> str:
                 bits.append(f"주문일 {kdate(od, now)} {od:%H:%M} ({when})")
             means = ", ".join(o.get("결제수단") or []) if isinstance(o.get("결제수단"), list) else str(o.get("결제수단") or "")
             bits.append(f"결제수단 {means or '불명'}, {pay}" + (f" ({kdate(pd, now)})" if pd and o.get("결제여부") == "T" else ""))
-            bits.append(f"배송상태 {st}")
+            bits.append(f"배송상태 {st}" + (" (취소된 주문: 반품·교환 대상 아님, 반품할 주문을 여쭐 때 선택지에서 뺀다)"
+                                           if st in ("취소완료", "입금전취소") else ""))
             if o.get("송장번호"):
                 bits.append(f"송장번호 {o['송장번호']}")
             if o.get("출고예정일자"):
@@ -374,6 +375,9 @@ def _fix_dated(text: str, pat: re.Pattern, allowed: set[tuple[int, int]], fixes:
     return pat.sub(sub, text)
 
 
+_ORDER_DATE_PHRASE = re.compile(r"(?:\d{4}\s*년\s*)?\d{1,2}\s*월\s*\d{1,2}\s*일(?:에|자로)?\s*(?=(?:주문|구매|결제))")
+
+
 def verify_answer(text: str, evidence: str, now: datetime) -> tuple[str, list[str]]:
     """① 주문일·배송완료일을 틀리게 말했고 근거의 날짜가 하나면 고친다 ② 근거에 없는 날짜를 말한 문장은 뺀다.
     (고친 답, 고치거나 뺀 내용)"""
@@ -381,6 +385,12 @@ def verify_answer(text: str, evidence: str, now: datetime) -> tuple[str, list[st
     order_dates = {(int(a), int(b)) for a, b in re.findall(r"주문일 (?:\d{4}년 )?(\d{1,2})월 (\d{1,2})일", evidence)}
     done_dates = {(int(a), int(b)) for a, b in re.findall(r"배송완료일 (?:\d{4}년 )?(\d{1,2})월 (\d{1,2})일", evidence)}
     text = _fix_dated(text, _ORDERED_ON, order_dates, fixes)
+    if not order_dates:
+        # 근거에 주문일이 없는데 'N월 N일에 주문하신'이라고 함 (실측 P0189-01: 반품 조회 결과의 주문번호 앞자리를 날짜로 읽음)
+        new = _ORDER_DATE_PHRASE.sub("", text)
+        if new != text:
+            fixes.append("근거에 없는 주문일 제거")
+            text = new
     text = _fix_dated(text, _DELIVERED_ON, done_dates, fixes)
     sents = split_sentences(text)
     if not sents:

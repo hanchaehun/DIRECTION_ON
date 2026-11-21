@@ -899,6 +899,23 @@ class Feedback2Test(unittest.TestCase):
         self.assertIn("주문일은 반품 조회 결과에 없다", rtxt)
         self.assertIn("20260915-0067173", rtxt)
 
+    def test_order_date_removed_without_evidence(self):
+        from agent import facts
+        now = datetime(2026, 10, 1, 12)
+        ev_ret = "주문일은 반품 조회 결과에 없다.\n1) 주문번호 20260915-0067173 / 현재상태 반품처리중[수거전]"
+        out, fixes = facts.verify_answer("9월 15일에 주문하신 이눌린 배변 가드는 반품처리중입니다.", ev_ret, now)
+        self.assertNotIn("9월 15일", out)
+        self.assertIn("근거에 없는 주문일 제거", fixes)
+        ev_ord = "1) 주문번호 20260928-0000001 / 주문일 9월 28일 08:25 (3일 전) / 배송상태 배송중"
+        self.assertEqual(facts.verify_answer("9월 28일에 주문하신 제품은 배송 중이에요.", ev_ord, now)[0],
+                         "9월 28일에 주문하신 제품은 배송 중이에요.")                               # 근거가 있으면 그대로
+
+    def test_cancelled_order_marked(self):
+        from agent import facts
+        body = {"status": "ok", "data": {"orders": [{"주문번호": "20260924-0076068", "상세주문번호": "20260924-0076068-01",
+                "주문일자": "2026-09-24 10:00:00", "제품명": "x", "옵션": "x", "수량": 1, "결제여부": "T", "배송상태": "취소완료"}]}}
+        self.assertIn("반품·교환 대상 아님", facts.render_tool_result("get_order_info", body, datetime(2026, 10, 1, 12)))
+
     def test_needs_return_lookup(self):
         from agent.toolflow import needs_return_lookup
         self.assertTrue(needs_return_lookup("환불은 언제까지 이뤄지나요?", [], True))
