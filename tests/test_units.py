@@ -569,5 +569,77 @@ class DirectLibTest(unittest.TestCase):
             self.assertIn(t, p)
 
 
+class LiveContinuationTest(unittest.TestCase):
+    """시연 모드: 번호를 끊어 읽어도 기다리고, 확정 직후 이어 말하면 앞말과 합친다."""
+
+    def _sess(self, mode="live"):
+        from agent.session import Session
+        from agent.metrics import Timeline
+        ss = object.__new__(Session)
+        ss.s, ss.mode = S, mode
+        ss.speech_started, ss.voiced_now = True, False
+        ss.routes, ss.route_pending = {}, {}
+        ss.tl = Timeline("t", "c", mode)
+        ss.history, ss.spoken = [], []
+        ss.turn_customer, ss.customer_pushed, ss.opener_text = "", False, ""
+        return ss
+
+    def _wait(self, ss, text):
+        for ms in range(0, 3001, 50):
+            if ss._commit_rule(text, "x", ms, 0):
+                return ms
+        return None
+
+    def test_live_waits_like_measure_for_numbers_and_connectives(self):
+        for mode in ("live", "measure"):
+            ss = self._sess(mode)
+            self.assertEqual(self._wait(ss, "제 번호는 010 1234."), S.commit_incomplete_ms, mode)
+            self.assertEqual(self._wait(ss, "주문번호는 20261003"), S.commit_incomplete_ms, mode)
+            self.assertEqual(self._wait(ss, "공일공 일이삼사"), S.commit_incomplete_ms, mode)   # 한글로 읽은 번호
+            self.assertEqual(self._wait(ss, "어제 주문했는데."), S.commit_noun_ms, mode)
+        # 다 읽은 번호·완결 질문은 시연 모드에서 그대로 빠르다
+        live = self._sess("live")
+        self.assertEqual(self._wait(live, "010-1234-5678."), S.live_commit_fast_ms)
+        self.assertEqual(self._wait(live, "배송이 언제 오나요?"), S.live_commit_fast_ms)
+
+    def test_mergeable_only_before_real_answer(self):
+        ss = self._sess()
+        ss.turn_customer, ss.opener_text = "제 번호는 010 1234", "네, 확인해 드리겠습니다."
+        self.assertTrue(ss._mergeable())                                   # 아무 말도 안 했음
+        ss.spoken = [{"text": "네, 확인해 드리겠습니다.", "ms": 900}]
+        self.assertTrue(ss._mergeable())                                   # 첫마디만 했음
+        ss.spoken.append({"text": "주문번호를 말씀해 주시겠어요?", "ms": 1500})
+        self.assertFalse(ss._mergeable())                                  # 실제 답을 시작했음
+        ss2 = self._sess()
+        ss2.turn_customer = "주문 취소해 주세요"
+        ss2.tl.count("tool_calls")
+        self.assertFalse(ss2._mergeable())                                 # 함수를 이미 실행했음
+        ss3 = self._sess()
+        ss3.turn_customer = "주문한 거 언제 와요?"
+        ss3.tl.count("bank_direct")
+        self.assertFalse(ss3._mergeable())                                 # 고정 답을 냈음
+        self.assertFalse(self._sess()._mergeable())                         # 앞말이 없음
+
+    def test_merge_moves_text_to_next_turn(self):
+        ss = self._sess()
+        sent = []
+
+        async def send_json(obj):
+            sent.append(obj)
+
+        class Stt:
+            def text(self):
+                return "5678."
+
+        ss._send_json, ss.stt, ss.final_task = send_json, Stt(), None
+        ss.turn_customer, ss.customer_pushed = "제 번호는 010 1234", True
+        ss.history = [{"role": "agent", "text": "이전 답"}, {"role": "customer", "text": "제 번호는 010 1234"}]
+        asyncio.run(ss._finish_interrupted())
+        self.assertEqual(sent[0]["type"], "agent.cancel")
+        self.assertEqual(ss.history, [{"role": "agent", "text": "이전 답"}])  # 이력에서 되돌림
+        self.assertEqual(ss._turn_text(), "제 번호는 010 1234 5678.")          # 다음 턴은 합친 글로 판단
+        self.assertEqual(self._wait(ss, ss._turn_text()), S.live_commit_fast_ms)
+
+
 if __name__ == "__main__":
     unittest.main()

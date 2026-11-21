@@ -31,7 +31,7 @@ from .clips import tool_kind
 from .metrics import Timeline
 from .router import choose_bank, choose_opener
 from .turn import classify
-from .textnorm import for_tts, norm_compare
+from .textnorm import for_tts, norm_compare, trailing_digits
 from .toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls, reask_for
 from .tts import TTSError, TTSJob
 
@@ -85,8 +85,8 @@ def _unfinished_tail(text: str) -> str:
     - 'connective': '요' 없이 연결어미로 끝남 ('어제 주문했는데.'). '~는데요.'는 요청을 끝맺는 말로도 흔해 제외"""
     body = re.sub(r"[.?!。？！\s]+$", "", text.strip())
     m = _TAIL_DIGITS.search(body)
-    if m:
-        d = re.sub(r"\D", "", m.group(1))
+    d = re.sub(r"\D", "", m.group(1)) if m else trailing_digits(body)    # '공일공 일이삼사'처럼 한글로 읽은 번호도
+    if d:
         if (d.startswith("01") and len(d) < 10) or (re.match(r"0[2-6]", d) and len(d) < 9) \
                 or (d.startswith("20") and 8 <= len(d) < 15):
             return "partial_number"
@@ -322,7 +322,7 @@ class Session:
         if self.stt.end_seen:
             self.tl.mark("end_token")
         if self.phase == "listening":
-            self._live_event("stt.partial", text=self.stt.text())
+            self._live_event("stt.partial", text=self._turn_text())
             self._evaluate(perf())
         elif self.mode == "live":
             self._check_barge(perf())
@@ -360,7 +360,7 @@ class Session:
         if self.phase != "listening":
             return
         s = self.s
-        text = self.stt.text()
+        text = self._turn_text()
         norm = norm_compare(text)
         silence_ms = self._silence_ms()
         quiet = self.speech_started and not self.voiced_now
@@ -406,8 +406,9 @@ class Session:
         elif _unfinished_tail(t):
             # 번호를 읽다 멈췄거나 연결어미로 끝남: Soniox가 마침표를 찍어도 이어 말하는 경우가 많다 (블라인드 감사)
             # 번호를 읽다 멈춘 경우는 실제로 번호가 깨져 끝난 말(연습 P0095-06, P0193-02)도 있어 조금만 더 기다린다
+            # 시연 모드도 빨리 받아치지 않는다: 번호를 세 자리·네 자리씩 끊어 읽으며 1초 가까이 쉬는 사람이 많다
             name = _unfinished_tail(t)
-            thr = s.live_commit_mid_ms if live else (s.commit_incomplete_ms if name == "partial_number" else s.commit_noun_ms)
+            thr = s.commit_incomplete_ms if name == "partial_number" else s.commit_noun_ms
         elif classify(t, "", s) == "preamble":
             # 인사·용건 예고뿐: 뒤에 본론이 이어지는 경우가 많다
             thr, name = s.commit_preamble_ms, "preamble"
@@ -605,6 +606,20 @@ class Session:
                 if t and not t.done():
                     t.cancel()
 
+    def _turn_text(self) -> str:
+        """이번 턴의 고객 말. 확정 직후 이어 말해 합친 경우 앞부분을 붙인다."""
+        carry = getattr(self, "carry_text", "")
+        return (carry + " " + self.stt.text()).strip() if carry else self.stt.text()
+
+    def _mergeable(self) -> bool:
+        """끼어든 말이 '말을 이어 간 것'인가: 상담원이 첫마디(채움말)만 했고 실제 답·함수 실행은 아직이면 그렇다.
+        이때는 앞말과 이어 말을 한 문장으로 합쳐 다시 판단한다 (예: '010 1234' 확정 → 첫마디 → '5678')."""
+        if not (self.turn_customer or self.tl.info.get("transcript")):
+            return False
+        if self.tl.counts.get("tool_calls", 0) or self.tl.counts.get("bank_direct", 0):
+            return False
+        return all(seg.get("text") == self.opener_text for seg in self.spoken)
+
     async def _finish_interrupted(self) -> None:
         await self._send_json({"type": "agent.cancel"})
         ft = getattr(self, "final_task", None)
@@ -613,6 +628,17 @@ class Session:
                 await asyncio.wait_for(asyncio.shield(ft), 1.0)   # 끊긴 턴의 손님 말을 이력에 남기기 위해
             except Exception:
                 pass
+        if self.mode == "live" and self._mergeable():
+            # 이력에 남기지 않고 다음 턴 앞에 붙인다. 이미 이력에 넣었으면 되돌린다
+            said = self.turn_customer
+            last = self.history[-1] if self.history else {}
+            if self.customer_pushed and last.get("role") == "customer" and last.get("text") == said:
+                self.history.pop()
+            self.customer_pushed = True                    # 턴 끝에서 다시 넣지 않게
+            self.carry_text = said
+            self.tl.event("carry", chars=len(said))
+            self.tl.info["interrupted_after"] = "(이어 말함: 합침)"
+            return
         played = self._remember_agent_turn(interrupted=True)
         if self.s.live_agent_text:
             await self.stt.send_agent_text("", end_of_segment=True)   # 들려준 데까지만, 세그먼트 닫기
@@ -651,6 +677,11 @@ class Session:
             await asyncio.sleep(0.02)
         self.tl.info["final_lag_ms"] = round(self.speech_end_audio_ms - self.stt.final_audio_ms)
         final = self.stt.final_text() or self.stt.text()
+        carry = getattr(self, "carry_text", "")
+        if carry:                                          # 끊겼다가 이어 말한 앞부분을 붙인다 (시연 모드)
+            final = (carry + " " + final).strip()
+            self.carry_text = ""
+            self.tl.event("merged", chars=len(carry))
         self.tl.info["transcript"] = final
         self.tl.mark("final_text")
         self.turn_customer = final
@@ -678,7 +709,7 @@ class Session:
         s = self.s
         self.phase = "responding"
         t_commit = perf()
-        text0 = self.stt.text()
+        text0 = self._turn_text()
         route = self._route_for(text0)
         # 확정 받아쓰기는 별도 작업으로 바로 시작한다. 첫 소리를 기다리지 않게 하고, 시연 모드에서 말하는 도중
         # 끼어들어 응답이 취소돼도 받아쓰기는 다음 턴으로 넘어가게 한다 (실측: 이전 턴 글이 다음 턴에 섞였다)
