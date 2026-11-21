@@ -13,41 +13,41 @@
 
 | 역할 | 모델 | 게이트웨이 경로 | 실측 |
 |---|---|---|---|
-| 🎧 받아쓰기 | Soniox 실시간 | `/soniox/transcribe-websocket` | 연결 70ms |
-| 🧠 판단 | GPT-5.4 mini | `/chat/completions/` | 판단 약 1.5초 |
-| 🔊 목소리 | Gemini 3.8 Flash TTS | `/audio/speech/` | 스트리밍 없음, 문장당 약 3초 |
-| 👂 눈치 | Jev `jev-1.14.0` | `/decisions/` | 0.4~0.6초 |
+| 받아쓰기 | Soniox 실시간 | `/soniox/transcribe-websocket` | 연결 70ms |
+| 판단 | GPT-5.4 mini | `/chat/completions/` | 판단 약 1.5초 |
+| 목소리 | Gemini 3.8 Flash TTS | `/audio/speech/` | 스트리밍 없음, 문장당 약 3초 |
+| 눈치 | Jev `jev-1.14.0` | `/decisions/` | 0.4~0.6초 |
 
 ---
 
 ## 전체 흐름
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#000000", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
 flowchart LR
   A([손님 음성]) --> B[받아쓰기]
-  B --> J{{Jev<br/>끝났나·화났나·용건}}
+  B --> J{{Jev 판정<br/>끝났나 · 화났나 · 용건}}
   B --> C{말 끝?}
   J -.-> C
   C -- 끝 --> D{지름길?}
   J -.-> D
-  D -- 인사·번호 요청 --> R1[🔊 녹음 답]
-  D -- 그 밖 --> R2[🔊 녹음 첫마디]
-  R2 --> L[🧠 LLM]
-  L -- 바로 답 --> T1[🔊 답 합성]
+  D -- 인사 · 번호 요청 --> R1[녹음 답]
+  D -- 그 밖 --> R2[녹음 첫마디]
+  R2 --> L[LLM 판단]
+  L -- 바로 답 --> T1[답 합성]
   L -- 조회 --> K{번호 검사}
-  K -- 깨짐 --> R3[🔊 번호 다시 요청]
-  K -- 통과 --> F[(전산 조회·접수)]
-  F --> M[사실 요약·날짜 계산]
-  M --> L2[🧠 LLM 2차<br/>첫 문장 번호 선택]
-  L2 --> T2[🔊 녹음 첫 문장 + 합성]
+  K -- 깨짐 --> R3[녹음: 번호 다시 요청]
+  K -- 통과 --> F[(전산 조회 · 접수)]
+  F --> M[사실 요약 · 날짜 계산]
+  M --> L2[LLM 2차<br/>첫 문장 번호 선택]
+  L2 --> T2[녹음 첫 문장 + 합성]
 
-  classDef rec fill:#e8f5e9,stroke:#2e7d32;
-  classDef jev fill:#fff3e0,stroke:#ef6c00,stroke-width:2px;
-  class R1,R2,R3,T2 rec;
+  classDef default fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+  classDef jev fill:#ffffff,stroke:#000000,stroke-width:5px,color:#000000,font-weight:bold;
   class J jev;
 ```
 
-🔊 초록 = 미리 녹음한 음성(바로 나감) · 🟧 주황 = 판정 모델 Jev · 점선 = Jev 판정이 참고로 들어감
+"녹음" = 미리 합성해 둔 음성(바로 나감) · 굵은 테두리 = 판정 모델 Jev · 점선 = Jev 판정이 참고로 들어감
 
 ---
 
@@ -56,12 +56,12 @@ flowchart LR
 | 말 끝 뒤 | 측정 모드 (채점) | 일어나는 일 |
 |:---:|---|---|
 | 0초 | 손님 말이 끝남 | |
-| 0.45초 | 👂 Jev에 질문 | 끝났나 · 화났나 · 용건 |
-| 1.0초 | ✅ 말 끝 확정 | 문장부호로 끝난 말 기준 |
-| **1.1초** | 🔊 **첫 소리** | 녹음된 첫마디 또는 고정 답 |
-| 2.5초 | 🧠 LLM 판단 | 바로 답 / 함수 호출 |
-| 3.3초 | 🗄️ 조회 결과 | 측정기 중계 0.8~1.5초 |
-| **4.7초** | 🔊 **조회 뒤 답** | 결과 뒤 1.4초, 녹음 첫 문장 |
+| 0.45초 | Jev에 질문 | 끝났나 · 화났나 · 용건 |
+| 1.0초 | 말 끝 확정 | 문장부호로 끝난 말 기준 |
+| **1.1초** | **첫 소리** | 녹음된 첫마디 또는 고정 답 |
+| 2.5초 | LLM 판단 | 바로 답 / 함수 호출 |
+| 3.3초 | 조회 결과 | 측정기 중계 0.8~1.5초 |
+| **4.7초** | **조회 뒤 답** | 결과 뒤 1.4초, 녹음 첫 문장 |
 
 ---
 
@@ -69,12 +69,12 @@ flowchart LR
 
 | 경로 | 예 | Jev | 첫 소리 | 실제 답 |
 |---|---|:---:|:---:|:---:|
-| 인사만 | "여보세요?" | – | 1.6초 | = 첫 소리 |
-| 번호 없이 조회 요청 | "주문한 거 언제 와요?" | ✅ | 1.0초 | = 첫 소리 |
-| 일반 질문 | "먹어 보고 효과 없으면 반품돼요?" | ✅ | 1.1초 | 5~6초 |
-| 조회 필요 | "010-○○○○-○○○○로 주문한 거요" | ✅ | 1.1초 | 결과 뒤 1.4초 |
-| 번호가 깨짐 | "공일공에… 칠칠…" | ✅ | 1.1초 | 번호 다시 요청 |
-| Jev 응답 없음 | (어떤 질문이든) | ❌ | 1.1초 | 지름길만 포기 |
+| 인사만 | "여보세요?" | 안 씀 | 1.6초 | = 첫 소리 |
+| 번호 없이 조회 요청 | "주문한 거 언제 와요?" | 씀 | 1.0초 | = 첫 소리 |
+| 일반 질문 | "먹어 보고 효과 없으면 반품돼요?" | 씀 | 1.1초 | 5~6초 |
+| 조회 필요 | "010-○○○○-○○○○로 주문한 거요" | 씀 | 1.1초 | 결과 뒤 1.4초 |
+| 번호가 깨짐 | "공일공에… 칠칠…" | 씀 | 1.1초 | 번호 다시 요청 |
+| Jev 응답 없음 | (어떤 질문이든) | 없음 | 1.1초 | 지름길만 포기 |
 
 ---
 
@@ -91,7 +91,7 @@ flowchart LR
 | 말 고치는 중 "아니," "잠깐만요." | – | 2.5초 | 생각하며 쉼 |
 | 문장부호 없음 + Jev | 1.0~2.0초 | 0.8~2.0초 | Jev 완결 확률로 |
 
-> ⚠️ 손님이 말하는 도중 소리를 내면 그 문항의 속도 점수는 0점이라, 대기는 보수적으로 잡는다.
+> 손님이 말하는 도중 소리를 내면 그 문항의 속도 점수는 0점이라, 대기는 보수적으로 잡는다.
 
 ---
 
@@ -143,7 +143,7 @@ flowchart LR
 
 ## 측정 모드 vs 시연 모드
 
-| | 📏 측정 모드 (채점) | 🎤 시연 모드 (사람과 대화) |
+| | 측정 모드 (채점) | 시연 모드 (사람과 대화) |
 |---|---|---|
 | 켜지는 조건 | 기본값 | `session.start`에 `"mode": "live"` |
 | 대화 | 질문 하나 | 여러 턴 |
@@ -154,10 +154,13 @@ flowchart LR
 | 말 속도 맞춤 (pace) | 발동 안 함 | 느린 사람: 대기 최대 1.2배, 재생 0.85배 |
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#000000", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
 flowchart LR
-  T1[1턴<br/>기록만] --> T2[2턴<br/>느리면 대기 ↑ · 재생 ↓]
+  T1[1턴<br/>기록만] --> T2[2턴<br/>느리면 대기 늘림 · 재생 느리게]
   T2 -- 끊김 --> X[이어 말한 것으로 합침<br/>그 쉼을 학습]
   X --> T3[3턴<br/>학습한 쉼만큼 기다림]
+
+  classDef default fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
 ```
 
 ---
@@ -192,7 +195,7 @@ python demo/serve.py                    # 시연 화면 http://localhost:8080
 | 시연 모드 대화 점검 | `python bench/live_check.py` (`--slow 0.75`: 느린 고객) |
 | 제출 ZIP (음성 캐시 포함) | `python ops/make_submission.py` |
 
-> 📁 대회 제공 데이터는 공개 저장소에 올리지 않는다. `data/brand/*`, `data/mock_db.json`, `data/examples.json`은 공식 자료에서 복사한다 (`data/README.md`).
+> 대회 제공 데이터는 공개 저장소에 올리지 않는다. `data/brand/*`, `data/mock_db.json`, `data/examples.json`은 공식 자료에서 복사한다 (`data/README.md`).
 
 ---
 
