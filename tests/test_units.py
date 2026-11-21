@@ -582,6 +582,9 @@ class LiveContinuationTest(unittest.TestCase):
         ss.tl = Timeline("t", "c", mode)
         ss.history, ss.spoken = [], []
         ss.turn_customer, ss.customer_pushed, ss.opener_text = "", False, ""
+        from agent import pace
+        ss.pace, ss.turn_voiced_ms, ss.turn_pauses, ss.carry_voiced_ms = pace.Profile(), 0.0, [], 0.0
+        ss.audio_ms, ss.voiced_run_ms, ss.speech_end_audio_ms = 0.0, 0.0, 0.0
         return ss
 
     def _wait(self, ss, text):
@@ -639,6 +642,86 @@ class LiveContinuationTest(unittest.TestCase):
         self.assertEqual(ss.history, [{"role": "agent", "text": "이전 답"}])  # 이력에서 되돌림
         self.assertEqual(ss._turn_text(), "제 번호는 010 1234 5678.")          # 다음 턴은 합친 글로 판단
         self.assertEqual(self._wait(ss, ss._turn_text()), S.live_commit_fast_ms)
+
+
+class PaceTest(unittest.TestCase):
+    """말 속도·쉼에 맞춘 대기 조절: 늘리기만 하고, 근거가 없으면 그대로, 측정 모드는 기본 끔."""
+
+    def test_turn_rate_needs_evidence(self):
+        from agent import pace
+        self.assertIsNone(pace.turn_rate("네 맞아요", 2000, S))                               # 글자 부족
+        self.assertIsNone(pace.turn_rate("배송이 언제쯤 도착하는지 궁금합니다", 800, S))       # 소리 시간 부족
+        self.assertIsNone(pace.turn_rate("제 번호는 010 1234 5678 이에요 네", 4000, S))       # 번호 위주
+        r = pace.turn_rate("배송이 언제쯤 도착하는지 궁금합니다", 5000, S)                     # 16자 / 5초
+        self.assertAlmostEqual(r, 3.2, places=1)
+
+    def test_adjust_only_lengthens_within_cap(self):
+        from agent import pace
+        kw = dict(s=S, mode="live")
+        self.assertEqual(pace.adjust(600, "punct", rate=7.0, own_pause_ms=0, **kw)[0], 600)      # 빠른 사람: 그대로 (줄이지 않는다)
+        self.assertEqual(pace.adjust(600, "punct", rate=None, own_pause_ms=0, **kw)[0], 600)     # 근거 없음
+        slow, info = pace.adjust(600, "punct", rate=3.0, own_pause_ms=0, **kw)
+        self.assertAlmostEqual(slow, 600 * S.pace_max_factor)                                    # 느린 사람: 최대 배율
+        self.assertEqual(info["base_ms"], 600)
+        mid, _ = pace.adjust(600, "punct", rate=4.6, own_pause_ms=0, **kw)
+        self.assertTrue(600 < mid < slow)
+        own, _ = pace.adjust(600, "punct", rate=None, own_pause_ms=800, **kw)
+        self.assertAlmostEqual(own, 800 * S.pace_pause_margin)                                   # 본인이 쉬던 만큼은 기다린다
+        capped, _ = pace.adjust(600, "punct", rate=None, own_pause_ms=3000, **kw)
+        self.assertEqual(capped, 600 + S.pace_max_extra_live_ms)                                 # 상한
+        self.assertEqual(pace.adjust(2000, "connective", rate=2.0, own_pause_ms=900, **kw)[0], 2000)  # 이미 긴 규칙은 그대로
+        self.assertEqual(pace.adjust(1000, "punct", rate=2.0, own_pause_ms=900, s=S, mode="measure")[0], 1000)  # 측정 모드 기본 끔
+
+    def test_profile(self):
+        from agent import pace
+        p = pace.Profile()
+        p.note_rate(None); p.note_rate(50.0)
+        self.assertIsNone(p.rate)                                                                # 이상값은 버린다
+        p.note_rate(4.0); p.note_rate(5.0)
+        self.assertAlmostEqual(p.rate, 4.4)
+        p.note_pause(50); p.note_pause(900); p.note_pause(700)
+        self.assertEqual(p.pause_hint(), 900)
+
+    def test_commit_rule_waits_longer_for_slow_speaker(self):
+        h = LiveContinuationTest()
+        q = "배송이 언제쯤 도착하는지 궁금합니다."
+        fast = h._sess("live")
+        fast.turn_voiced_ms = 2500                                                               # 16자 / 2.5초 = 6.4자/초
+        self.assertEqual(h._wait(fast, q), S.live_commit_fast_ms)
+        slow = h._sess("live")
+        slow.turn_voiced_ms = 5000                                                               # 3.2자/초
+        self.assertEqual(h._wait(slow, q), 850)                                                  # 600 × 1.4 = 840 → 50ms 단위로 850
+        self.assertEqual(slow.tl.info["pace"]["base_ms"], 600)
+        learned = h._sess("live")
+        learned.pace.note_pause(900)                                                             # 지난번에 0.9초 쉬고 이어 말한 사람
+        self.assertEqual(h._wait(learned, "네 맞아요."), 1150)                                   # 900 × 1.25 = 1125 → 1150
+        meas = h._sess("measure")
+        meas.turn_voiced_ms = 5000
+        self.assertEqual(h._wait(meas, q), S.commit_complete_ms)                                 # 측정 모드는 그대로 1.0초
+
+    def test_audio_tracks_voiced_time_and_pauses(self):
+        from agent.session import Session
+        from agent.audio import BYTES_PER_MS
+        h = LiveContinuationTest()
+        ss = h._sess("live")
+        ss.audio_ms, ss.first_audio_wall, ss.thr, ss.noise = 0.0, 0.0, 300.0, []
+        ss.speech_started, ss.voiced_run_ms = False, 0.0
+        ss.last_voiced_audio_ms, ss.last_voiced_wall, ss.phase = None, None, "listening"
+
+        class Stt:
+            def push_audio(self, pcm):
+                pass
+
+        ss.stt = Stt()
+        ss._evaluate = lambda now: None
+        loud = (np.ones(int(20 * BYTES_PER_MS / 2), dtype=np.int16) * 3000).tobytes()
+        quiet = bytes(int(20 * BYTES_PER_MS))
+        for chunk, n in ((loud, 50), (quiet, 30), (loud, 25), (quiet, 5), (loud, 10)):          # 1.0초 말, 0.6초 쉼, 0.5초 말, 0.1초 끊김, 0.2초 말
+            for _ in range(n):
+                Session._on_audio(ss, chunk)
+        self.assertAlmostEqual(ss.turn_voiced_ms, 1700, delta=1)
+        self.assertEqual(len(ss.turn_pauses), 1)                                                 # 0.1초 끊김은 쉼이 아니다
+        self.assertAlmostEqual(ss.turn_pauses[0], 600, delta=21)
 
 
 if __name__ == "__main__":

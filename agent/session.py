@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from websockets.exceptions import ConnectionClosed
 
-from . import aftertool, directlib, facts, knowledge
+from . import aftertool, directlib, facts, knowledge, pace
 from .audio import BYTES_PER_MS, chunks, rms, silence
 from .brain import Decision, parse_now
 from .clips import tool_kind
@@ -171,6 +171,10 @@ class Session:
         self.t_start = perf()
         self.audio_ms = 0.0
         self.first_audio_wall: float | None = None
+        self.pace = pace.Profile()          # 말하는 사람의 속도·쉼 버릇 (통화 동안 유지)
+        self.turn_voiced_ms = 0.0           # 이번 턴에 실제 소리가 난 시간
+        self.turn_pauses: list[float] = []  # 이번 턴의 말 중간 쉼 (ms)
+        self.carry_voiced_ms = 0.0
         self.thr = self.s.silence_rms
         self.noise: list[float] = []
         self.history: list[dict] = []
@@ -241,6 +245,10 @@ class Session:
             self.last_voiced_audio_ms: float | None = None
             self.last_voiced_wall: float | None = None
         self.voiced_now = False
+        # 이번 턴의 소리 시간·쉼 기록을 새로 시작한다. 끊긴 말을 이어 붙이는 턴이면 앞말의 소리 시간을 더한다
+        self.turn_voiced_ms = (self.voiced_run_ms if keep_speech else 0.0) + self.carry_voiced_ms
+        self.carry_voiced_ms = 0.0
+        self.turn_pauses = []
         # 지난 턴에 쓰이지 않은 미리 합성은 버린다
         for old in (getattr(self, "early", None), getattr(getattr(self, "spec", None), "early", None)):
             if old is not None:
@@ -304,7 +312,12 @@ class Session:
                     log.info("%s 소음 바닥 %.0f → 임계값 %.0f", self.sid, floor, self.thr)
         voiced = r >= self.thr
         if voiced:
+            if self.speech_started and self.voiced_run_ms == 0.0 and self.last_voiced_audio_ms is not None:
+                gap = self.audio_ms - dt - self.last_voiced_audio_ms      # 쉬었다가 다시 말하기 시작함
+                if gap >= self.s.pace_min_pause_ms and self.phase == "listening":
+                    self.turn_pauses.append(gap)
             self.voiced_run_ms += dt
+            self.turn_voiced_ms += dt
             self.last_voiced_audio_ms, self.last_voiced_wall = self.audio_ms, now
             if not self.speech_started and self.voiced_run_ms >= self.s.speech_start_ms:
                 self.speech_started = True
@@ -431,11 +444,20 @@ class Session:
             thr, name = s.commit_incomplete_ms, "incomplete"
         else:
             thr, name = s.commit_very_incomplete_ms, "very_incomplete"
+        base_thr = thr
+        pace_info: dict = {}
+        if pace.enabled(s, self.mode) and name in pace.ADJUSTABLE:
+            # 느리게 말하는 사람, 말 중간에 길게 쉬는 사람은 더 기다린다 (늘리기만 한다)
+            rate = pace.turn_rate(t, self.turn_voiced_ms, s) or self.pace.rate
+            own = max(max(self.turn_pauses, default=0.0), self.pace.pause_hint())
+            thr, pace_info = pace.adjust(thr, name, rate=rate, own_pause_ms=own, s=s, mode=self.mode)
         if silence_ms < thr:
             return None
+        if pace_info:
+            self.tl.info["pace"] = pace_info
         # 확정 시점에 판정이 오는 중이면 조금 더 기다린다: 판정이 있어야 고정 답 바로 응답·첫마디 선택을 할 수 있다
         # (게이트웨이 경유 판정은 p50 0.46초, 무음 0.45초에 부르면 확정 1.0초 무렵에 도착한다)
-        if (r is None and s.use_router and thr <= s.jev_commit_wait_max_thr_ms and self._similar_pending(norm)
+        if (r is None and s.use_router and base_thr <= s.jev_commit_wait_max_thr_ms and self._similar_pending(norm)
                 and silence_ms < thr + s.jev_commit_wait_ms):
             return None
         return name
@@ -468,7 +490,8 @@ class Session:
         self.tl.mark("speech_end", self.speech_end_wall, overwrite=True)
         self.tl.mark("commit", now)
         self.tl.info.update(rule=rule, text_at_commit=text)
-        self._live_event("turn.commit", rule=rule, text=text)
+        self.pace.note_rate(pace.turn_rate(text, self.turn_voiced_ms, self.s))
+        self._live_event("turn.commit", rule=rule, text=text, pace=self.tl.info.get("pace"))
         self.commit_evt.set()
 
     # ───────────────────────── 추측 실행 (시연 모드) ─────────────────────────
@@ -636,7 +659,11 @@ class Session:
                 self.history.pop()
             self.customer_pushed = True                    # 턴 끝에서 다시 넣지 않게
             self.carry_text = said
-            self.tl.event("carry", chars=len(said))
+            self.carry_voiced_ms = max(0.0, self.turn_voiced_ms - self.voiced_run_ms)
+            # 끝난 줄 알고 받아쳤는데 말을 이어 갔다: 이 사람은 그만큼 쉬는 사람이다 → 다음부터 더 기다린다
+            gap = (self.audio_ms - self.voiced_run_ms) - self.speech_end_audio_ms
+            self.pace.note_pause(gap)
+            self.tl.event("carry", chars=len(said), gap_ms=round(gap))
             self.tl.info["interrupted_after"] = "(이어 말함: 합침)"
             return
         played = self._remember_agent_turn(interrupted=True)

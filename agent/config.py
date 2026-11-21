@@ -66,6 +66,15 @@ class Settings:
     spec_measure: bool = False           # 측정 모드에서는 끈다 (첫 소리는 미리 합성한 음성이라 점수에 영향 없음, 호출만 는다)
     tts_unit_chars: int = 70             # 한 번에 합성하는 글자 수 상한 (긴 문장은 TTS가 7초를 넘긴 실측)
     sentence_gap_ms: int = 150           # 문장 사이 숨
+    pace_adapt: str = "live"             # 말 속도·쉼에 맞춰 말 끝 대기를 늘린다: off / live(시연만) / all. 합성 음성은 속도와 쉼이 무관해 측정 모드는 끔
+    pace_ref_cps: float = 5.3            # 기준 발음 속도(글자/초, 쉼 제외). 이보다 느리면 그 비율만큼 더 기다린다
+    pace_max_factor: float = 1.4
+    pace_max_extra_live_ms: int = 600    # 늘어나는 대기의 상한 (시연)
+    pace_max_extra_measure_ms: int = 300  # (측정: 첫 소리가 1.5초 안에 남는 범위)
+    pace_min_chars: int = 8              # 이보다 짧은 말로는 속도를 재지 않는다
+    pace_min_voiced_ms: int = 1500
+    pace_pause_margin: float = 1.25      # 이 사람이 보인 쉼의 이 배수만큼은 기다린다
+    pace_min_pause_ms: int = 250         # 이보다 짧은 끊김은 쉼으로 치지 않는다
     first_unit_chars: int = 24           # 첫 합성 단위 목표 길이. 첫 문장이 길면 쉼표에서 앞부분만 먼저 합성한다 (TTS 시간은 글자 수에 비례)
     first_unit_min_chars: int = 8        # 쉼표로 나눌 때 앞부분 최소 길이
     comma_gap_ms: int = 80               # 쉼표로 나눈 두 조각 사이 숨
