@@ -1,6 +1,241 @@
+# Haruon Real-Time Voice Agent
+
+> DIRECT:ON 2026 · A real-time voice AI that handles phone support for "Haruon", a health supplement brand
+
+English · [한국어](#하루온-실시간-음성-상담원)
+
+## At a Glance
+
+| First sound (p50) | Answer after lookup (p50) | Speed score | Function score | Barge-ins |
+|:---:|:---:|:---:|:---:|:---:|
+| **1.09 s** | **1.43 s** | **98.6** | **92.9** | **0** |
+| full marks ≤ 1.5 s | full marks ≤ 3.5 s | /100 | /100 | 28 cases |
+
+<sub>28 practice cases · 4 concurrent · real models via the gateway</sub>
+
+| Role | Model | Gateway path | Measured |
+|---|---|---|---|
+| Speech-to-text | Soniox real-time | `/soniox/transcribe-websocket` | connect 70 ms |
+| Reasoning | GPT-5.4 mini | `/chat/completions/` | decision ~1.5 s |
+| Voice | Gemini 3.8 Flash TTS | `/audio/speech/` | no streaming, ~3 s per sentence |
+| Turn judge | Jev `jev-1.14.0` | `/decisions/` | 0.4–0.6 s |
+
+---
+
+## Overall Flow
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#808080", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
+flowchart LR
+  A([Caller audio]) --> B[Speech-to-text]
+  B --> J{{Jev judge<br/>done? · upset? · intent}}
+  B --> C{End of turn?}
+  J -.-> C
+  C -- yes --> D{Shortcut?}
+  J -.-> D
+  D -- greeting · ask for number --> R1[Recorded answer]
+  D -- otherwise --> R2[Recorded opener]
+  R2 --> L[LLM decision]
+  L -- direct answer --> T1[Synthesize answer]
+  L -- lookup --> K{Number check}
+  K -- garbled --> R3[Recorded: ask number again]
+  K -- ok --> F[(Order system lookup · request)]
+  F --> M[Fact summary · date math]
+  M --> L2[LLM round 2<br/>pick first sentence by number]
+  L2 --> T2[Recorded first sentence + synthesis]
+
+  classDef default fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+  linkStyle default stroke:#808080,stroke-width:3px;
+  classDef jev fill:#ffffff,stroke:#000000,stroke-width:5px,color:#000000,font-weight:bold;
+  class J jev;
+```
+
+"Recorded" = pre-synthesized audio (plays instantly) · thick border = Jev turn judge · gray dotted line = Jev result used as a hint
+
+---
+
+## Timeline of One Turn
+
+| After end of speech | Measurement mode (scoring) | What happens |
+|:---:|---|---|
+| 0 s | Caller stops speaking | |
+| 0.45 s | Ask Jev | done? · upset? · intent |
+| 1.0 s | End of turn confirmed | for a sentence ending in punctuation |
+| **1.1 s** | **First sound** | recorded opener or fixed answer |
+| 2.5 s | LLM decision | answer directly / call a function |
+| 3.3 s | Lookup result | evaluator relay adds 0.8–1.5 s |
+| **4.7 s** | **Answer after lookup** | 1.4 s after the result, recorded first sentence |
+
+---
+
+## Paths by Question Type
+
+| Path | Example | Jev | First sound | Actual answer |
+|---|---|:---:|:---:|:---:|
+| Greeting only | "Hello?" | not used | 1.6 s | = first sound |
+| Lookup request without a number | "When will my order arrive?" | used | 1.0 s | = first sound |
+| General question | "Can I return it if it doesn't work?" | used | 1.1 s | 5–6 s |
+| Needs a lookup | "My order under 010-xxxx-xxxx" | used | 1.1 s | 1.4 s after result |
+| Garbled number | "zero one zero… seven seven…" | used | 1.1 s | ask number again |
+| No Jev response | (any question) | none | 1.1 s | only skips shortcuts |
+
+---
+
+## End-of-Turn Rules
+
+| How the transcript ends | Measure | Demo | Why |
+|---|:---:|:---:|---|
+| Punctuation `.` `?` | 1.0 s | 0.8 s | finished sentence |
+| Ends with a noun ("Shipping question.") | 2.0 s | 1.0 s | may continue |
+| Reading a number ("010 1234.") | 1.6 s | 1.6 s | digits missing |
+| Connective ending ("I ordered, but…") | 2.0 s | 2.0 s | will continue |
+| Greeting / preamble ("Hello.") | 1.6 s | 1.6 s | main request follows |
+| Comma / ellipsis ("Gut supplement,") | 2.4 s | 2.4 s | will continue |
+| Correcting oneself ("No," "Wait.") | – | 2.5 s | pauses to think |
+| No punctuation + Jev | 1.0–2.0 s | 0.8–2.0 s | by Jev completion probability |
+
+> Speaking while the caller is still talking scores 0 for speed on that case, so the waits are conservative.
+
+---
+
+## Where Jev Is Used
+
+| | ① End of turn | ② Shortcut (fixed answer) | ③ Choosing the opener |
+|---|---|---|---|
+| Question | Finished? | Intent? | Upset? Intent? |
+| Rule | completion ≥ 0.5 → 1.0 s<br/>0.25–0.5 → 1.6 s<br/>< 0.25 → 2.0 s | confidence ≥ 0.9 alone<br/>or ≥ 0.55 agreeing with keywords | upset ≥ 0.8 → "Sorry for the trouble"<br/>lookup intent → "Let me check" |
+| Without Jev | 1.1 s | not used (except greetings) | chosen by keywords |
+
+---
+
+## Why Pre-Recorded Audio
+
+| Characters | Time to first TTS audio |
+|:---:|:---:|
+| 9 | 2.96 s |
+| 28 | 3.05 s |
+| 83 | 5.09 s |
+
+The gateway TTS does not stream, and even a short sentence takes about 3 s. So **123 frequently used sentences are pre-synthesized**, and the LLM chooses which one to play.
+
+| Pre-recorded | Used for |
+|---|---|
+| Openers (empathy · check · info) | first sound of every answer |
+| Fixed answers (greeting, ask for number, how to buy) | answer without the LLM |
+| First sentence after lookup ("I checked, it's on the way.") | LLM picks it by number |
+| Per-product first sentence ("The product you asked about is …") | after a product search |
+| Ask number again ("Please say the 11 digits one by one…") | when the number is garbled |
+
+---
+
+## Safeguards
+
+| Failure prevented | Safeguard |
+|---|---|
+| Filing a request with a garbled number | 11-digit mobile and order-number format checks, example numbers blocked |
+| Number heard slightly wrong | corrected against earlier conversation and caller ID (edit distance 3–4) |
+| Lookup returns nothing | retry with other numbers from the conversation |
+| Wrong dates in the answer | days elapsed and return window computed in code, answer dates verified |
+| "I checked…" without a lookup | sent back once for a new decision |
+| "I've filed it" without a successful request | sent back once · replaced if already filed |
+| **Return/exchange of a cancelled order** | **request blocked + removed from choices** |
+| Wrong recording played ("40,000 won" vs "50,000 won") | recording not used if numbers or negations differ |
+| Answer too long | 3 sentences · 130 characters max |
+
+---
+
+## Measurement Mode vs Demo Mode
+
+| | Measurement mode (scoring) | Demo mode (talking with a person) |
+|---|---|---|
+| Enabled by | default | `"mode": "live"` in `session.start` |
+| Conversation | one question | multiple turns |
+| Barge-in | – | stops speaking, keeps only what was played in history |
+| Cut-off speech | – | merged with the previous words if only the opener was played |
+| Run LLM before end of turn | off | on |
+| Short FAQ recorded answers | off | 8 kinds |
+| Speaking-pace adaptation (pace) | never triggers | slow speakers: wait up to 1.2×, playback 0.85× |
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontSize": "16px", "primaryColor": "#ffffff", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "lineColor": "#808080", "edgeLabelBackground": "#ffffff", "tertiaryColor": "#ffffff"}}}%%
+flowchart LR
+  T1[Turn 1<br/>record only] --> T2[Turn 2<br/>slow speaker: wait longer · play slower]
+  T2 -- cut off --> X[Merge as continued speech<br/>learn that pause]
+  X --> T3[Turn 3<br/>wait for the learned pause]
+
+  classDef default fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+  linkStyle default stroke:#808080,stroke-width:3px;
+```
+
+---
+
+## Gateway Constraints
+
+| Constraint | Handling |
+|---|---|
+| PII filter masks phone numbers and emails | swapped for `{{PHONE_n}}` placeholders and restored |
+| Some dates are masked | dates sent in Korean words |
+| 120 requests per minute per key | capped at 115 overall, 25 reserved for Jev (`agent/ratelimit.py`) |
+| TTS does not stream | pre-synthesis + parallel per-sentence synthesis + early first-sentence synthesis |
+
+---
+
+## Run
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env                    # one BAZE gateway key for all models
+bash start_mock.sh data/mock_db.json    # mock function server :8100
+bash start_server.sh                    # agent server :9000
+python demo/serve.py                    # demo page http://localhost:8080
+```
+
+| Task | Command |
+|---|---|
+| Unit tests | `python -m unittest tests.test_units -v` |
+| Speech-to-text accuracy | `python bench/stt_eval.py` |
+| Jev and fixed-answer accuracy | `python bench/jev_eval.py` |
+| Response and function scores (no TTS) | `python bench/text_eval.py --stt --judge-model gpt-6-luna` |
+| Demo-mode conversation check | `python bench/live_check.py` (`--slow 0.75`: slow caller) |
+| Submission ZIP (with audio cache) | `python ops/make_submission.py` |
+
+> Competition data is not committed to the public repository. Copy `data/brand/*`, `data/mock_db.json` and `data/examples.json` from the official materials (`data/README.md`).
+
+---
+
+## Folder Structure
+
+| Path | Role |
+|---|---|
+| `agent/server.py` | entry point, warms pre-synthesized audio (opens the port first) |
+| `agent/session.py` | one call: end of turn → first sound → decision → functions → answer |
+| `agent/router.py` | Jev judge, keyword rules, fixed answer and opener choice |
+| `agent/brain.py` | prompt assembly, GPT-5.4 mini, PII placeholders |
+| `agent/toolflow.py` | checks before and after function calls, retries, answer guards |
+| `agent/facts.py` | number correction, lookup summaries, answer verification |
+| `agent/aftertool.py` | first-sentence list after a lookup |
+| `agent/clips.py` | pre-synthesized sentences and matching rules |
+| `agent/pace.py` | pace-adaptive waits and playback speed |
+| `agent/tts.py` · `stt.py` | Gemini TTS · Soniox speech-to-text |
+| `agent/ratelimit.py` | gateway rate limit |
+| `agent/prompts/` | system prompt, policy table, recorded sentence lists |
+| `mock_tools/server.py` | mock function server |
+| `demo/` | demo page |
+| `bench/` · `tests/` | measurement and evaluation tools · unit tests |
+| `ops/make_submission.py` | submission ZIP |
+
+<br/>
+
+---
+---
+
+<br/>
+
 # 하루온 실시간 음성 상담원
 
 > DIRECT:ON 2026 · 건강기능식품 브랜드 "하루온"의 전화 상담을 맡는 실시간 음성 AI
+
+[English](#haruon-real-time-voice-agent) · 한국어
 
 ## 한눈에
 
