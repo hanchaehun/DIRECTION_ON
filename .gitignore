@@ -1,0 +1,9 @@
+.env
+runtime/
+__pycache__/
+*.pyc
+# 운영진 제공 데이터 (공개 금지) — data/README.md 참고
+data/brand/
+data/mock_db*.json
+data/examples.json
+data/legacy_starter/

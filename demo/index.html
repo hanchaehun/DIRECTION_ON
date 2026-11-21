@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>상담원 시연</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#111827; --sub:#6b7280; --line:#e5e7eb; --cust:#e8f0fe; --agent:#ecfdf5;
+          --accent:#2563eb; --warn:#b45309; --bad:#b91c1c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  header input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; }
+  button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; font-size:13px; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  #status { margin-left:auto; font-size:13px; color:var(--sub); }
+  #vu { width:80px; height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+  #vu > div { height:100%; width:0; background:#10b981; transition: width .05s; }
+  main { display:grid; grid-template-columns: 1.1fr 1fr; gap:14px; padding:14px 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; min-height:200px; }
+  h2 { font-size:14px; margin:0 0 8px; color:var(--sub); font-weight:600; }
+  #chat { display:flex; flex-direction:column; gap:8px; height:62vh; overflow:auto; }
+  .msg { max-width:85%; padding:8px 11px; border-radius:10px; font-size:15px; line-height:1.45; }
+  .cust { align-self:flex-end; background:var(--cust); }
+  .cust.partial { opacity:.6; font-style:italic; }
+  .agent { align-self:flex-start; background:var(--agent); }
+  .agent.cut::after { content:" (중단됨)"; color:var(--bad); font-size:12px; }
+  .meta { font-size:11px; color:var(--sub); margin-top:3px; }
+  #log { font: 12px/1.5 ui-monospace, Consolas, monospace; height:22vh; overflow:auto; white-space:pre-wrap; }
+  #bars svg { width:100%; height:auto; }
+  #handoff { display:none; border:2px solid var(--warn); border-radius:10px; padding:10px; margin-top:10px; background:#fffbeb; }
+  #handoff h3 { margin:0 0 6px; font-size:14px; color:var(--warn); }
+  #handoff dl { display:grid; grid-template-columns: 90px 1fr; gap:3px 8px; margin:0; font-size:13px; }
+  textarea { width:100%; height:52px; font-size:12px; border:1px solid var(--line); border-radius:6px; padding:6px; }
+  details summary { cursor:pointer; font-size:12px; color:var(--sub); }
+</style>
+</head>
+<body>
+<header>
+  <input id="url" value="ws://localhost:9000" size="20" title="상담원 서버">
+  <input id="tools" value="http://localhost:8100" size="20" title="모의 함수 서버 (tools_url)">
+  <input id="cname" value="홍길동" size="6" title="발신자 이름">
+  <input id="cphone" value="01000001234" size="12" title="발신자 번호">
+  <button id="connect" class="primary">연결</button>
+  <button id="mic" disabled>마이크 켜기</button>
+  <label><button id="filebtn" disabled>파일로 말하기</button><input id="file" type="file" accept=".wav,audio/*" hidden></label>
+  <button id="hang" disabled>끊기</button>
+  <div id="vu" title="입력 음량"><div></div></div>
+  <span id="status">연결 안 됨</span>
+</header>
+<main>
+  <section>
+    <h2>통화</h2>
+    <div id="chat"></div>
+  </section>
+  <section>
+    <h2>진행 상황</h2>
+    <div id="bars"></div>
+    <div id="handoff"><h3>상담원 인계 요약</h3><dl id="hdl"></dl></div>
+    <h2 style="margin-top:10px">이벤트</h2>
+    <div id="log"></div>
+    <details><summary>가짜 STT 대본 (키 없이 시험할 때, 한 줄에 한 발화)</summary>
+      <textarea id="script">주문번호 데모 일 공 공 일 택배 어디쯤 왔어요?
+잠깐만요 그거 취소할 수 있어요?
+반품 배송비는 얼마예요?
+먹고 나서 속이 좀 안 좋은데요</textarea></details>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const RATE = 16000, FRAME = 320;            // 20ms
+let ws = null, ctx = null, micNode = null, micStream = null, micOn = false;
+let playNodes = [], nextPlay = 0;            // 예약된 재생 노드 전부 보관 (끊기면 모두 stop)
+let fileFrames = [], pumpTimer = null, pumpNext = 0;
+let curCust = null, curAgent = null, turnNo = 0;
+
+function log(t) { const el = $("log"); el.textContent += t + "\n"; el.scrollTop = el.scrollHeight; }
+function status(t) { $("status").textContent = t; }
+function bubble(cls, text) {
+  const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text;
+  $("chat").appendChild(d); $("chat").scrollTop = $("chat").scrollHeight; return d;
+}
+function nowStr() { const d = new Date(), p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; }
+
+// ── 재생 ──
+function playPcm(buf) {
+  const i16 = new Int16Array(buf); if (!i16.length) return;
+  const ab = ctx.createBuffer(1, i16.length, RATE), ch = ab.getChannelData(0);
+  for (let i = 0; i < i16.length; i++) ch[i] = i16[i] / 32768;
+  const src = ctx.createBufferSource(); src.buffer = ab; src.connect(ctx.destination);
+  const at = Math.max(ctx.currentTime + 0.03, nextPlay);
+  src.start(at); nextPlay = at + ab.duration;
+  playNodes.push(src);
+  src.onended = () => { playNodes = playNodes.filter((n) => n !== src); };
+}
+function stopPlayback() {
+  for (const n of playNodes) { try { n.stop(); } catch (e) {} }
+  playNodes = []; nextPlay = 0;
+}
+
+// ── 보내기: 마이크 또는 파일. 아무것도 없으면 무음(전화선처럼) ──
+function sendFrame(i16) { if (ws && ws.readyState === 1) ws.send(i16.buffer); }
+function vu(i16) { let s = 0; for (const v of i16) s += v * v; const r = Math.sqrt(s / i16.length);
+  $("vu").firstChild.style.width = Math.min(100, r / 30) + "%"; }
+function pump() {                            // 20ms 간격 (타이머가 밀리면 따라잡는다)
+  const t = performance.now();
+  while (pumpNext <= t) {
+    pumpNext += 20;
+    if (fileFrames.length) { const f = fileFrames.shift(); vu(f); sendFrame(f); }
+    else if (!micOn) sendFrame(new Int16Array(FRAME));
+  }
+}
+const WORKLET = `class Cap extends AudioWorkletProcessor { constructor(){ super(); this.b = new Int16Array(${FRAME}); this.n = 0; }
+  process(inp){ const c = inp[0] && inp[0][0]; if (c) for (let i = 0; i < c.length; i++) { const v = Math.max(-1, Math.min(1, c[i]));
+    this.b[this.n++] = v < 0 ? v * 32768 : v * 32767; if (this.n === ${FRAME}) { this.port.postMessage(this.b.slice(0)); this.n = 0; } }
+    return true; } } registerProcessor("cap", Cap);`;
+async function toggleMic() {
+  if (micOn) { micOn = false; micStream && micStream.getTracks().forEach((t) => t.stop()); micNode && micNode.disconnect();
+    $("mic").textContent = "마이크 켜기"; return; }
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+  micNode = new AudioWorkletNode(ctx, "cap");
+  micNode.port.onmessage = (e) => { if (!fileFrames.length) { vu(e.data); sendFrame(e.data); } };
+  ctx.createMediaStreamSource(micStream).connect(micNode);
+  micOn = true; $("mic").textContent = "마이크 끄기";
+}
+async function sayFile(file) {
+  const ab = await ctx.decodeAudioData(await file.arrayBuffer());      // ctx가 16kHz라 자동 변환
+  const ch = ab.getChannelData(0), frames = [];
+  for (let i = 0; i < ch.length; i += FRAME) {
+    const f = new Int16Array(FRAME);
+    for (let j = 0; j < FRAME && i + j < ch.length; j++) { const v = Math.max(-1, Math.min(1, ch[i + j])); f[j] = v < 0 ? v * 32768 : v * 32767; }
+    frames.push(f);
+  }
+  fileFrames.push(...frames); log(`파일 ${file.name} ${(ch.length / RATE).toFixed(1)}초 보내는 중`);
+}
+
+// ── 서버 이벤트 ──
+function onEvent(e) {
+  switch (e.type) {
+    case "stt.partial":
+      if (!e.text) break;
+      if (!curCust) curCust = bubble("cust partial", "");
+      curCust.textContent = e.text; break;
+    case "turn.commit":
+      turnNo++; if (!curCust) curCust = bubble("cust", "");
+      curCust.className = "msg cust"; curCust.textContent = e.text;
+      const m = document.createElement("div"); m.className = "meta"; m.textContent = `커밋 ${e.rule} · ${e.verdict}`;
+      curCust.appendChild(m); curCust = null; curAgent = null;
+      log(`[${turnNo}] 커밋 ${e.rule} (${e.verdict}) "${e.text}"`); break;
+    case "agent.transcript":
+      if (!curAgent) curAgent = bubble("agent", e.text); else curAgent.firstChild.textContent += " " + e.text;
+      break;
+    case "tool.call": log(`  함수 ${e.name} ${JSON.stringify(e.args)}`); break;
+    case "tool.result": log(`  결과 ${e.name} ${e.status} ${e.ms}ms ${JSON.stringify(e.body).slice(0, 120)}`); break;
+    case "agent.cancel": stopPlayback(); if (curAgent) curAgent.classList.add("cut"); curAgent = null; log("  끼어들기 → 재생 중단"); break;
+    case "handoff": showHandoff(e); break;
+    case "turn.metrics": drawBars(e); break;
+    case "turn.end": curAgent = null; break;
+  }
+}
+function showHandoff(e) {
+  const rows = [["사유", e.reason], ["고객", e.caller ? `${e.caller.name || ""} ${e.caller.phone || ""}` : "-"],
+    ["확인한 정보", Object.entries(e.facts || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "-"],
+    ["수행한 조치", (e.actions || []).map((a) => `${a.name}(${JSON.stringify(a.args)}) → ${a.status}`).join(" / ") || "-"],
+    ["문의 요약", e.summary || "-"]];
+  $("hdl").innerHTML = ""; for (const [k, v] of rows) { const dt = document.createElement("dt"), dd = document.createElement("dd");
+    dt.textContent = k; dd.textContent = v; dd.style.margin = 0; $("hdl").append(dt, dd); }
+  $("handoff").style.display = "block"; log("  상담원 인계 요약 생성");
+}
+function drawBars(e) {                      // 말 끝 = 0, 겹침 막대
+  const m = e.marks || {}, se = m.speech_end; if (se == null) return;
+  const rel = (k) => (m[k] == null ? null : m[k] - se);
+  const bars = [["말", rel("speech_start"), 0, "#9aa4b1"],
+    [e.counts && e.counts.spec_hit ? "추측 LLM" : "LLM", e.counts && e.counts.spec_hit ? rel("spec_first") : rel("commit"), rel("decision"), "#3b82f6"],
+    ["함수", rel("tool_call"), rel("tool_resp"), "#f59e0b"], ["TTS 대기", rel("tts_req"), rel("tts_first"), "#a855f7"],
+    ["음성", rel("first_sound"), rel("turn_end"), "#10b981"]];
+  const lo = -2, hi = Math.max(4, (rel("turn_end") || 0) + 0.5), W = 520, L = 70, H = 30 + bars.length * 20 + 20;
+  const x = (s) => L + (Math.max(lo, Math.min(hi, s)) - lo) / (hi - lo) * (W - L - 10);
+  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-size="11" font-family="sans-serif">`;
+  s += `<text x="4" y="14" fill="#374151">${turnNo}턴 · 커밋 ${e.rule} · 첫 소리 ${e.first_sound ?? "-"}ms</text>`;
+  for (let t = Math.ceil(lo); t <= hi; t++) s += `<line x1="${x(t)}" y1="20" x2="${x(t)}" y2="${H - 14}" stroke="#eee"/><text x="${x(t)}" y="${H - 2}" text-anchor="middle" fill="#9ca3af">${t}s</text>`;
+  s += `<line x1="${x(0)}" y1="18" x2="${x(0)}" y2="${H - 14}" stroke="#111" stroke-dasharray="3 3"/>`;
+  s += `<line x1="${x(1.5)}" y1="18" x2="${x(1.5)}" y2="${H - 14}" stroke="#ef4444" stroke-dasharray="2 3"/>`;
+  bars.forEach(([n, a, b, c], i) => { const y = 24 + i * 20; s += `<text x="${L - 6}" y="${y + 11}" text-anchor="end" fill="#374151">${n}</text>`;
+    if (a != null && b != null && b > a) s += `<rect x="${x(a)}" y="${y}" width="${Math.max(2, x(b) - x(a))}" height="14" rx="3" fill="${c}"/>`; });
+  const c = rel("commit"); if (c != null) s += `<line x1="${x(c)}" y1="20" x2="${x(c)}" y2="${H - 14}" stroke="#111" stroke-width="2"/>`;
+  $("bars").innerHTML = s + "</svg>";
+}
+
+// ── 연결 ──
+async function connect() {
+  ctx = new AudioContext({ sampleRate: RATE }); await ctx.resume();
+  ws = new WebSocket($("url").value); ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    const script = $("script").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    ws.send(JSON.stringify({ type: "session.start", session_id: "LIVE-" + Date.now(), mode: "live", now: nowStr(), history: [],
+      caller: { name: $("cname").value || null, phone: $("cphone").value || null, email: null },
+      tools_url: $("tools").value || null, audio: { encoding: "pcm_s16le", sample_rate: RATE, channels: 1 }, fake_script: script }));
+    pumpNext = performance.now(); pumpTimer = setInterval(pump, 10);
+    status("연결됨"); ["mic", "filebtn", "hang"].forEach((id) => ($(id).disabled = false)); $("connect").disabled = true;
+    log("연결: " + $("url").value);
+  };
+  ws.onmessage = (m) => { if (typeof m.data === "string") onEvent(JSON.parse(m.data)); else playPcm(m.data); };
+  ws.onclose = () => { status("연결 끊김"); clearInterval(pumpTimer); stopPlayback();
+    ["mic", "filebtn", "hang"].forEach((id) => ($(id).disabled = true)); $("connect").disabled = false; };
+}
+$("connect").onclick = () => connect().catch((e) => { log("연결 실패: " + e); status("오류"); });
+$("mic").onclick = () => toggleMic().catch((e) => log("마이크 오류: " + e + " (http://localhost 로 열었는지 확인)"));
+$("filebtn").onclick = () => $("file").click();
+$("file").onchange = () => { for (const f of $("file").files) sayFile(f); $("file").value = ""; };
+$("hang").onclick = () => { if (micOn) toggleMic(); ws && ws.close(); };
+if (!["localhost", "127.0.0.1"].includes(location.hostname)) log("주의: 마이크는 http://localhost 에서만 동작한다 (브라우저 보안 정책).");
+</script>
+</body>
+</html>
