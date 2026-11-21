@@ -23,10 +23,19 @@ AUDIO = ROOT.parent / "directon-2026-voice-cs" / "data" / "audio" / "practice"
 FRAME = 640
 
 
+SLOW = 1.0     # --slow: 고객 음성을 이 배속으로 바꿔 보낸다 (느리게 말하는 사람 재현, 음높이 유지)
+
+
 def load(cid: str) -> tuple[bytes, float]:
     meta = json.loads((AUDIO / "meta.json").read_text(encoding="utf-8"))
     with wave.open(str(AUDIO / f"{cid}.wav")) as w:
-        return w.readframes(w.getnframes()), meta[cid]["speech_end"]
+        pcm, end = w.readframes(w.getnframes()), meta[cid]["speech_end"]
+    if abs(SLOW - 1.0) > 1e-3:
+        import sys
+        sys.path.insert(0, str(ROOT))
+        from agent.audio import time_stretch
+        pcm, end = time_stretch(pcm, SLOW), end / SLOW
+    return pcm, end
 
 
 def rms(b: bytes) -> float:
@@ -43,7 +52,10 @@ async def main() -> int:
     ap.add_argument("--barge-after", type=float, default=1.2, help="앞 턴 답의 첫 소리 뒤 몇 초에 끼어들지")
     ap.add_argument("--caller-name", default="")
     ap.add_argument("--caller-phone", default="")
+    ap.add_argument("--slow", type=float, default=1.0, help="고객 음성 배속 (0.75 = 느리게 말하는 사람)")
     a = ap.parse_args()
+    global SLOW
+    SLOW = a.slow
     turns = [load(c) for c in a.turns.split(",")]
     caller = {"name": a.caller_name or None, "phone": a.caller_phone or None, "email": None} if (a.caller_name or a.caller_phone) else None
     log: list[str] = []

@@ -668,10 +668,14 @@ class PaceTest(unittest.TestCase):
         kept, info = pace.adjust(600, "punct", rate=8.0, own_pause_ms=560, **kw)
         self.assertAlmostEqual(kept, 560 * S.pace_pause_margin)                                 # 빨라도 본인이 쉬던 만큼은 기다린다
         self.assertEqual(info["base_ms"], 600)
+        learned, _ = pace.adjust(600, "punct", rate=None, own_pause_ms=750, **kw)
+        self.assertAlmostEqual(learned, 750 * S.pace_pause_margin)                              # 0.75초 쉬던 사람: 0.94초 (속도 배율 상한 1.2배에 묶이지 않는다)
         capped, _ = pace.adjust(600, "punct", rate=None, own_pause_ms=3000, **kw)
-        self.assertAlmostEqual(capped, 600 * S.pace_max_factor)                                 # 상한 1.2배
+        self.assertAlmostEqual(capped, 600 + S.pace_max_extra_live_ms)                          # 본인 쉼 상한: +0.6초
+        self.assertAlmostEqual(pace.adjust(600, "punct", rate=2.0, own_pause_ms=0, **kw)[0], 600 * S.pace_max_factor)  # 속도 상한: 1.2배
         self.assertEqual(pace.adjust(2000, "connective", rate=2.0, own_pause_ms=900, **kw)[0], 2000)  # 이미 긴 규칙은 그대로
-        self.assertEqual(pace.adjust(1000, "punct", rate=2.0, own_pause_ms=900, s=S, mode="measure")[0], 1000)  # 측정 모드 기본 끔
+        meas = pace.adjust(1000, "punct", rate=2.0, own_pause_ms=900, s=S, mode="measure")[0]
+        self.assertLessEqual(meas, 1000 + S.pace_max_extra_measure_ms)                          # 측정 모드 상한 +0.3초 (첫 소리 1.5초 안)
 
     def test_profile(self):
         from agent import pace
@@ -686,19 +690,25 @@ class PaceTest(unittest.TestCase):
     def test_commit_rule_waits_longer_for_slow_speaker(self):
         h = LiveContinuationTest()
         q = "배송이 언제쯤 도착하는지 궁금합니다."
+        first = h._sess("live")
+        first.turn_voiced_ms = 5000                                                              # 첫 턴: 느려도 기록만 하고 적용하지 않는다
+        self.assertEqual(h._wait(first, q), S.live_commit_fast_ms)
+        self.assertNotIn("pace", first.tl.info)
         fast = h._sess("live")
+        fast.pace.note_rate(6.4)
         fast.turn_voiced_ms = 2500                                                               # 16자 / 2.5초 = 6.4자/초
         self.assertEqual(h._wait(fast, q), S.live_commit_fast_ms)                                # 빠른 사람: 그대로
         slow = h._sess("live")
+        slow.pace.note_rate(3.2)                                                                 # 이전 턴에 느리게 말한 사람
         slow.turn_voiced_ms = 5000                                                               # 3.2자/초
         self.assertEqual(h._wait(slow, q), 750)                                                  # 600 × 1.2 = 720 → 50ms 단위로 750
         self.assertEqual(slow.tl.info["pace"]["base_ms"], 600)
         learned = h._sess("live")
-        learned.pace.note_pause(500)                                                             # 지난번에 0.5초 쉬고 이어 말한 사람
-        self.assertEqual(h._wait(learned, "네 맞아요."), 650)                                    # 500 × 1.25 = 625 → 650 (상한 720 안)
+        learned.pace.note_pause(750)                                                             # 지난번에 0.75초 쉬고 이어 말한 사람
+        self.assertEqual(h._wait(learned, "네 맞아요."), 950)                                    # 750 × 1.25 = 938 → 950 (다음 턴엔 기다린다)
         meas = h._sess("measure")
         meas.turn_voiced_ms = 5000
-        self.assertEqual(h._wait(meas, q), S.commit_complete_ms)                                 # 측정 모드는 그대로 1.0초
+        self.assertEqual(h._wait(meas, q), S.commit_complete_ms)                                 # 채점(질문 하나): 이전 턴 기록이 없어 그대로 1.0초
 
     def test_audio_tracks_voiced_time_and_pauses(self):
         from agent.session import Session
@@ -723,6 +733,137 @@ class PaceTest(unittest.TestCase):
         self.assertAlmostEqual(ss.turn_voiced_ms, 1700, delta=1)
         self.assertEqual(len(ss.turn_pauses), 1)                                                 # 0.1초 끊김은 쉼이 아니다
         self.assertAlmostEqual(ss.turn_pauses[0], 600, delta=21)
+
+
+class AnswerGuardTest(unittest.TestCase):
+    """접수 완료라는 말, 번호 재질문, 반품 조회 동시 호출, 상세주문번호 검증."""
+
+    def _run(self, name, status, called=True):
+        from agent.toolflow import ToolRun
+        from agent.brain import ToolCall
+        r = ToolRun(ToolCall("c1", name, {}, "{}"), {}, body={"status": status})
+        if called:
+            r.calls.append((name, {}, 200, 0))
+        return r
+
+    def test_write_claim(self):
+        from agent.toolflow import ALREADY_SENTENCE, write_claim_check
+        claim = "반품 접수해 드렸습니다. 영업일 기준 3~4일 안에 회수 기사님이 방문합니다."
+        self.assertEqual(write_claim_check(claim, [self._run("return_order", "ok")], False)[1], "")        # 성공: 그대로
+        fixed, issue = write_claim_check("반품 접수해 드렸습니다. 이미 반품이 접수되어 있습니다.",
+                                         [self._run("return_order", "already_requested")], False)
+        self.assertEqual((fixed, issue), ("이미 반품이 접수되어 있습니다.", "already"))                    # 자기모순 제거
+        fixed, issue = write_claim_check("반품 접수해 드렸습니다.", [self._run("return_order", "already_requested")], False)
+        self.assertEqual((fixed, issue), (ALREADY_SENTENCE, "already"))
+        self.assertEqual(write_claim_check(claim, [self._run("get_order_info", "ok")], False)[1], "false_claim")  # 접수 없이 접수했다고 함
+        self.assertEqual(write_claim_check(claim, [], True)[1], "")                                        # 이전 턴에 접수한 것을 말함
+        self.assertEqual(write_claim_check("접수된 요청은 담당 부서에 전달되어 있습니다.", [], False)[1], "")  # 이전 접수 안내는 해당 없음
+        self.assertEqual(write_claim_check("반품 접수해 드렸습니다.", [self._run("return_order", "ok", called=False)], False)[1],
+                         "false_claim")                                                                    # 막혀서 실제로 안 나간 접수
+
+    def test_history_flags(self):
+        from agent.toolflow import history_write_succeeded, lookup_failed_before
+        h_ok = [{"role": "tool_result", "name": "return_order", "result": {"status": "ok"}}]
+        self.assertTrue(history_write_succeeded(h_ok))
+        self.assertFalse(history_write_succeeded([{"role": "tool_result", "name": "return_order", "result": {"status": "already_requested"}}]))
+        self.assertTrue(lookup_failed_before([{"role": "tool_result", "name": "get_order_info", "result": {"status": "ok", "data": {"orders": []}}}]))
+        self.assertFalse(lookup_failed_before(h_ok))
+
+    def test_asks_for_number(self):
+        from agent.toolflow import asks_for_number
+        self.assertTrue(asks_for_number("주문번호나 주문하신 분 성함과 연락처를 말씀해 주시겠어요?"))
+        self.assertTrue(asks_for_number("휴대폰 번호를 알려 주시겠어요?"))
+        self.assertFalse(asks_for_number("확인해 보니 현재 배송 중이에요."))
+
+    def test_add_return_lookup(self):
+        from agent.brain import Decision, ToolCall
+        from agent.toolflow import add_return_lookup
+
+        def dec(*calls):
+            tcs = [ToolCall(f"c{i}", n, a, json.dumps(a)) for i, (n, a) in enumerate(calls)]
+            return Decision("tool", tool_calls=tcs, assistant_msg={"role": "assistant", "content": None, "tool_calls": [
+                {"id": t.id, "type": "function", "function": {"name": t.name, "arguments": t.raw}} for t in tcs]})
+
+        d = dec(("get_order_info", {"buyer_cellphone": "010-8606-3732"}))
+        self.assertTrue(add_return_lookup(d, "환불은 언제까지 이뤄지나요?"))
+        self.assertEqual([t.name for t in d.tool_calls], ["get_order_info", "get_return_info"])
+        self.assertEqual(d.tool_calls[1].args, {"customer_phone_number": "010-8606-3732"})
+        self.assertEqual(len(d.assistant_msg["tool_calls"]), 2)                                            # 메시지에도 짝이 맞게
+        self.assertFalse(add_return_lookup(dec(("get_order_info", {"buyer_cellphone": "01012341234"})), "반품하고 싶어요"))   # 반품 요청은 해당 없음
+        self.assertFalse(add_return_lookup(dec(("get_order_info", {"order_id": "20261001-0001234"})), "환불 언제 돼요?"))     # 번호 없음
+        d2 = dec(("get_order_info", {"order_id": "20261001-0001234"}))
+        self.assertTrue(add_return_lookup(d2, "환불 언제 돼요?", caller_phone="01086063732"))               # 발신자 번호로
+        self.assertFalse(add_return_lookup(dec(("get_order_info", {"buyer_cellphone": "01000000000"}),
+                                               ("return_order", {"order_number": "x"})), "환불 언제 돼요?"))  # 접수와 함께면 안 함
+
+    def test_item_codes_must_come_from_lookup(self):
+        from agent.toolflow import block_reason
+        ctx = {"items": ["20260929-0004550-01", "20260929-0004550-02"], "orders": ["20260929-0004550"]}
+        bad = {"order_number": "20260929-0004550", "return_items": [{"order_item_code": "20260929-0004550-01", "quantity": 1},
+                                                                    {"order_item_code": "20260929-0047714-02", "quantity": 1}]}
+        self.assertIn("조회 결과에 없다", block_reason("return_order_item", bad, ctx))
+        good = {"order_number": "20260929-0004550", "return_items": [{"order_item_code": "20260929-0004550-02", "quantity": 1}]}
+        self.assertEqual(block_reason("return_order_item", good, ctx), "")
+        self.assertEqual(block_reason("return_order_item", bad, {"items": []}), "")                        # 조회 전이면 형식만 본다
+
+
+class SlowPlaybackTest(unittest.TestCase):
+    """느린 사람에게 상담원 음성을 느리게: 음높이 유지, 시연 모드·이전 턴 기록이 있을 때만, 변환이 첫 소리를 늦추지 않음."""
+
+    @staticmethod
+    def _tone(sec=2.0, hz=220.0):
+        t = np.arange(int(16000 * sec)) / 16000
+        return (np.sin(2 * np.pi * hz * t) * 8000).astype(np.int16).tobytes()
+
+    def test_stretch_keeps_pitch(self):
+        from agent.audio import time_stretch
+        src = self._tone()
+        for sp in (0.85, 0.9):
+            out = time_stretch(src, sp)
+            self.assertAlmostEqual(len(out) / len(src), 1 / sp, delta=0.04)
+            x = np.frombuffer(out, dtype=np.int16).astype(np.float64)[800:-800]
+            hz = np.sum((x[:-1] < 0) & (x[1:] >= 0)) / (len(x) / 16000)
+            self.assertAlmostEqual(hz, 220.0, delta=6)                                   # 음높이 그대로
+        self.assertEqual(time_stretch(src, 1.0), src)
+        self.assertEqual(time_stretch(self._tone(0.05), 0.85), self._tone(0.05))         # 너무 짧으면 그대로
+
+    def test_stretch_is_fast(self):
+        import time
+        from agent.audio import time_stretch
+        src = self._tone(10.0)
+        t0 = time.perf_counter()
+        time_stretch(src, 0.85)
+        self.assertLess(time.perf_counter() - t0, 0.15)                                  # 10초 문장도 0.15초 안 (첫 소리 손해 없음)
+
+    def test_play_speed_rules(self):
+        from agent import pace
+        p = pace.Profile()
+        self.assertEqual(pace.play_speed(p, S, "live"), 1.0)                              # 첫 턴 (기록 없음)
+        p.note_rate(6.5)
+        self.assertEqual(pace.play_speed(p, S, "live"), 1.0)                              # 빠른 사람: 그대로
+        q = pace.Profile(); q.note_rate(4.8)
+        self.assertEqual(pace.play_speed(q, S, "live"), 0.9)                              # 4.8/5.3 = 0.906 → 0.05 단위 0.9
+        r = pace.Profile(); r.note_rate(2.5)
+        self.assertEqual(pace.play_speed(r, S, "live"), S.pace_play_min_speed)           # 하한 0.85
+        self.assertEqual(pace.play_speed(r, S, "measure"), 1.0)                           # 채점은 늘 원래 속도
+
+    def test_paced_cache_and_fallback(self):
+        from agent.session import Session
+        import agent.session as sm
+        ss = object.__new__(Session)
+        ss.play_speed, ss.paced_cache = 0.9, {}
+        src = self._tone(1.0)
+        a = ss._paced(src)
+        self.assertIs(ss._paced(src), a)                                                  # 같은 문장은 한 번만 변환
+        ss.play_speed = 1.0
+        self.assertIs(ss._paced(src), src)
+        ss.play_speed, ss.paced_cache = 0.85, {}
+        orig = sm.time_stretch
+        sm.time_stretch = lambda *x, **k: (_ for _ in ()).throw(ValueError("boom"))
+        try:
+            self.assertEqual(ss._paced(src), src)                                         # 변환 실패 → 원래 음성
+        finally:
+            sm.time_stretch = orig
 
 
 if __name__ == "__main__":

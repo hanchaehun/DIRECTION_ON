@@ -42,7 +42,7 @@
   <input id="url" value="ws://localhost:9000" size="20" title="상담원 서버">
   <input id="tools" value="http://localhost:8100" size="20" title="모의 함수 서버 (tools_url)">
   <input id="cname" value="홍길동" size="6" title="발신자 이름">
-  <input id="cphone" value="01000001234" size="12" title="발신자 번호">
+  <input id="cphone" value="" placeholder="발신자 번호" size="12" title="발신자 번호 (비우면 발신자 정보 없이 시작)">
   <button id="connect" class="primary">연결</button>
   <button id="mic" disabled>마이크 켜기</button>
   <label><button id="filebtn" disabled>파일로 말하기</button><input id="file" type="file" accept=".wav,audio/*" hidden></label>
@@ -122,7 +122,10 @@ async function toggleMic() {
   if (micOn) { micOn = false; micStream && micStream.getTracks().forEach((t) => t.stop()); micNode && micNode.disconnect();
     $("mic").textContent = "마이크 켜기"; return; }
   micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+  if (!ctx.__capReady) {                     // 같은 AudioContext에 "cap"을 두 번 등록하면 실패한다
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+    ctx.__capReady = true;
+  }
   micNode = new AudioWorkletNode(ctx, "cap");
   micNode.port.onmessage = (e) => { if (!fileFrames.length) { vu(e.data); sendFrame(e.data); } };
   ctx.createMediaStreamSource(micStream).connect(micNode);
@@ -149,9 +152,11 @@ function onEvent(e) {
     case "turn.commit":
       turnNo++; if (!curCust) curCust = bubble("cust", "");
       curCust.className = "msg cust"; curCust.textContent = e.text;
-      const m = document.createElement("div"); m.className = "meta"; m.textContent = `커밋 ${e.rule} · ${e.verdict}`;
+      const pc = e.pace ? ` · 대기 ${e.pace.base_ms}→${e.pace.thr_ms}ms${e.pace.cps ? ` (${e.pace.cps}자/초)` : ""}` : "";
+      const m = document.createElement("div"); m.className = "meta"; m.textContent = `커밋 ${e.rule}${pc}`;
       curCust.appendChild(m); curCust = null; curAgent = null;
-      log(`[${turnNo}] 커밋 ${e.rule} (${e.verdict}) "${e.text}"`); break;
+      log(`[${turnNo}] 커밋 ${e.rule}${pc} "${e.text}"`); break;
+    case "turn.judge": log(`  Jev 완결 ${e.complete} · ${e.intent} ${e.conf} (${e.ms}ms)`); break;
     case "agent.transcript":
       if (!curAgent) curAgent = bubble("agent", e.text); else curAgent.firstChild.textContent += " " + e.text;
       break;

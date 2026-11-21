@@ -30,7 +30,7 @@ from agent import aftertool, facts, knowledge  # noqa: E402
 from agent.brain import Brain, OpenAIBackend, parse_now  # noqa: E402
 from agent.clips import ClipBank, load_phrases  # noqa: E402
 from agent.config import RUNTIME, Settings, env  # noqa: E402
-from agent import directlib  # noqa: E402
+from agent import directlib, toolflow  # noqa: E402
 from agent.router import Router, choose_bank, choose_opener  # noqa: E402
 from agent.session import normalize_history  # noqa: E402
 from agent.toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls, reask_for  # noqa: E402
@@ -76,6 +76,9 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
         return {"status_code": 200, "body": res, "ms": 0}
 
     guard_used = False
+    all_runs: list = []
+    prior_write = toolflow.history_write_succeeded(hist)
+    failed_before = toolflow.lookup_failed_before(hist)
     while True:
         if d.kind == "answer" and d.text:
             if rounds == 0 and directlib.has_mark(d.text):
@@ -99,9 +102,32 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
                 d = await brain.decide(msgs, tools, effort)
                 llm_calls += 1
                 continue
+        if d.kind == "answer" and not guard_used:
+            fixed, issue = toolflow.write_claim_check(d.text, all_runs, prior_write)
+            if issue == "already":
+                out["notes"].append("이미 접수된 건 → 문장 교체")
+                d.text = fixed
+            elif issue == "false_claim":
+                guard_used = True
+                out["notes"].append("성공한 접수 없이 접수했다고 함 → 다시 판단")
+                msgs = msgs + [d.assistant_msg, {"role": "system", "content": toolflow.WRITE_NOTE}]
+                d = await brain.decide(msgs, tools, effort)
+                llm_calls += 1
+                continue
+        if (d.kind == "answer" and not guard_used and rounds == 0 and not failed_before
+                and (ctx.get("caller_phone") or ctx.get("orders")) and toolflow.asks_for_number(d.text)):
+            guard_used = True
+            out["notes"].append("번호가 있는데 다시 물음 → 다시 판단")
+            msgs = msgs + [d.assistant_msg, {"role": "system", "content": toolflow.NUMBER_NOTE}]
+            d = await brain.decide(msgs, tools, effort)
+            llm_calls += 1
+            continue
         if not (d.kind == "tool" and rounds < s.max_tool_rounds):
             break
+        if toolflow.add_return_lookup(d, text, ctx.get("caller_phone", "")):
+            out["notes"].append("반품 조회 함께")
         runs = await execute_calls(d.tool_calls, ctx, call_fn, s, now)
+        all_runs += runs
         msgs = msgs + [d.assistant_msg]
         new_hist = []
         for run in runs:

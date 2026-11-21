@@ -24,8 +24,8 @@ from dataclasses import dataclass
 
 from websockets.exceptions import ConnectionClosed
 
-from . import aftertool, directlib, facts, knowledge, pace
-from .audio import BYTES_PER_MS, chunks, rms, silence
+from . import aftertool, directlib, facts, knowledge, pace, toolflow
+from .audio import BYTES_PER_MS, chunks, rms, silence, time_stretch
 from .brain import Decision, parse_now
 from .clips import tool_kind
 from .metrics import Timeline
@@ -116,6 +116,12 @@ class Spec:
     early: "EarlyTTS | None" = None
 
 
+async def _empty():
+    """빈 비동기 반복자."""
+    return
+    yield
+
+
 class EarlyTTS:
     """LLM 답이 스트리밍되는 동안 첫 합성 단위의 음성을 미리 만든다 (첫마디 뒤 공백 단축).
 
@@ -175,6 +181,8 @@ class Session:
         self.turn_voiced_ms = 0.0           # 이번 턴에 실제 소리가 난 시간
         self.turn_pauses: list[float] = []  # 이번 턴의 말 중간 쉼 (ms)
         self.carry_voiced_ms = 0.0
+        self.play_speed = 1.0               # 상담원 음성 재생 속도 (느린 사람에게 느리게)
+        self.paced_cache: dict = {}
         self.thr = self.s.silence_rms
         self.noise: list[float] = []
         self.history: list[dict] = []
@@ -317,7 +325,8 @@ class Session:
                 if gap >= self.s.pace_min_pause_ms and self.phase == "listening":
                     self.turn_pauses.append(gap)
             self.voiced_run_ms += dt
-            self.turn_voiced_ms += dt
+            if self.phase == "listening":            # 상담원이 말하는 동안의 소리(에코·잡음)는 세지 않는다
+                self.turn_voiced_ms += dt
             self.last_voiced_audio_ms, self.last_voiced_wall = self.audio_ms, now
             if not self.speech_started and self.voiced_run_ms >= self.s.speech_start_ms:
                 self.speech_started = True
@@ -446,20 +455,20 @@ class Session:
             thr, name = s.commit_very_incomplete_ms, "very_incomplete"
         base_thr = thr
         pace_info: dict = {}
-        if pace.enabled(s, self.mode) and name in pace.ADJUSTABLE:
+        if pace.enabled(s, self.mode) and name in pace.ADJUSTABLE and self.pace.ready():
             # 느리게 말하는 사람·말 중간에 길게 쉬는 사람은 더 기다린다 (1.0~1.2배, 줄이지는 않는다)
             rate = pace.turn_rate(t, self.turn_voiced_ms, s) or self.pace.rate
             own = max(max(self.turn_pauses, default=0.0), self.pace.pause_hint())
             thr, pace_info = pace.adjust(thr, name, rate=rate, own_pause_ms=own, s=s, mode=self.mode)
         if silence_ms < thr:
             return None
-        if pace_info:
-            self.tl.info["pace"] = pace_info
         # 확정 시점에 판정이 오는 중이면 조금 더 기다린다: 판정이 있어야 고정 답 바로 응답·첫마디 선택을 할 수 있다
         # (게이트웨이 경유 판정은 p50 0.46초, 무음 0.45초에 부르면 확정 1.0초 무렵에 도착한다)
         if (r is None and s.use_router and base_thr <= s.jev_commit_wait_max_thr_ms and self._similar_pending(norm)
                 and silence_ms < thr + s.jev_commit_wait_ms):
             return None
+        if pace_info:
+            self.tl.info["pace"] = pace_info            # 실제로 확정할 때만 남긴다
         return name
 
     async def _run_router(self, text: str, norm: str) -> None:
@@ -490,7 +499,6 @@ class Session:
         self.tl.mark("speech_end", self.speech_end_wall, overwrite=True)
         self.tl.mark("commit", now)
         self.tl.info.update(rule=rule, text_at_commit=text)
-        self.pace.note_rate(pace.turn_rate(text, self.turn_voiced_ms, self.s))
         self._live_event("turn.commit", rule=rule, text=text, pace=self.tl.info.get("pace"))
         self.commit_evt.set()
 
@@ -710,6 +718,7 @@ class Session:
             self.carry_text = ""
             self.tl.event("merged", chars=len(carry))
         self.tl.info["transcript"] = final
+        self.pace.note_rate(pace.turn_rate(final, self.turn_voiced_ms, self.s))   # 확정 받아쓰기로 잰다 (늦게 따라온 끝 글자 포함)
         self.tl.mark("final_text")
         self.turn_customer = final
         if self.mode == "measure":
@@ -741,6 +750,9 @@ class Session:
         # 확정 받아쓰기는 별도 작업으로 바로 시작한다. 첫 소리를 기다리지 않게 하고, 시연 모드에서 말하는 도중
         # 끼어들어 응답이 취소돼도 받아쓰기는 다음 턴으로 넘어가게 한다 (실측: 이전 턴 글이 다음 턴에 섞였다)
         self.final_task = asyncio.create_task(self._finalize_transcript(t_commit))
+        self.play_speed = pace.play_speed(self.pace, s, self.mode)    # 이전 턴까지 잰 말 속도로 이번 답의 재생 속도를 정한다
+        if self.play_speed < 1.0:
+            self.tl.info["play_speed"] = self.play_speed
         # 1. 첫 소리: 은행 직행 또는 첫마디. 확정 받아쓰기를 기다리지 않는다 (1.5초 안에 나가야 한다)
         bank_clip, opener_kind = None, ""
         if text0.strip():
@@ -811,6 +823,9 @@ class Session:
         s = self.s
         msgs = list(msgs)
         rounds, guard_used, after_tool = 0, False, False
+        all_runs: list = []
+        prior_write = toolflow.history_write_succeeded(self.history)      # 이번 턴 전에 이미 성공한 접수
+        failed_before = toolflow.lookup_failed_before(self.history)
         while True:
             if decision.kind == "answer" and decision.text:
                 # 직접 답의 첫 문장 번호([D번호]) → 미리 합성한 문장. 함수 결과 뒤 답에서는 번호 표시만 지운다
@@ -833,6 +848,27 @@ class Session:
                     msgs += [decision.assistant_msg, {"role": "system", "content": note}]
                     decision = await self._decide(msgs, s.reasoning_effort)
                     continue
+            if decision.kind == "answer" and not guard_used:
+                # 성공한 접수가 없는데 '접수해 드렸습니다'라고 하려 함 → 한 번 되돌린다 (이미 접수된 건이면 문장만 바꾼다)
+                fixed, issue = toolflow.write_claim_check(decision.text, all_runs, prior_write)
+                if issue == "already":
+                    self.tl.event("guard", why="이미 접수된 건을 접수했다고 함 → 문장 교체")
+                    decision.text = fixed
+                elif issue == "false_claim":
+                    guard_used = True
+                    self.tl.event("guard", why="성공한 접수 없이 접수했다고 함")
+                    msgs += [decision.assistant_msg, {"role": "system", "content": toolflow.WRITE_NOTE}]
+                    decision = await self._decide(msgs, s.reasoning_effort)
+                    continue
+            if (decision.kind == "answer" and not guard_used and rounds == 0 and not failed_before
+                    and (self.ctx_ids.get("caller_phone") or self.ctx_ids.get("orders"))
+                    and toolflow.asks_for_number(decision.text)):
+                # 발신자 번호·이전 대화 주문번호가 있는데 번호를 다시 물으려 함 → 조회부터 하게 한 번 되돌린다 (실측 P0010-11)
+                guard_used = True
+                self.tl.event("guard", why="번호가 있는데 다시 물음")
+                msgs += [decision.assistant_msg, {"role": "system", "content": toolflow.NUMBER_NOTE}]
+                decision = await self._decide(msgs, s.reasoning_effort)
+                continue
             if not (decision.kind == "tool" and rounds < s.max_tool_rounds):
                 break
             if not self.tools_url:
@@ -851,7 +887,10 @@ class Session:
                 if gap > 0:
                     await asyncio.sleep(gap)
             self.tl.mark("tool_call")
+            if toolflow.add_return_lookup(decision, self.turn_customer, self.ctx_ids.get("caller_phone", "")):
+                self.tl.event("co_lookup", name="get_return_info")      # 반품·환불 진행 문의: 반품 조회도 함께
             runs = await execute_calls(decision.tool_calls, self.ctx_ids, self._call_tool, s, self.now)
+            all_runs += runs
             msgs.append(decision.assistant_msg)
             for run in runs:
                 msgs.append({"role": "tool", "tool_call_id": run.tc.id, "content": run.content})
@@ -996,7 +1035,9 @@ class Session:
         if self.mode == "live" and _HANDOFF_SAID.search(body):
             self._send_handoff("상담원 연결 안내")
         spoke = 0
-        sent_gap, comma_gap = silence(s.sentence_gap_ms), silence(s.comma_gap_ms)
+        slow = getattr(self, "play_speed", 1.0) < 1.0
+        stretch = 1.0 / getattr(self, "play_speed", 1.0)              # 느리게 들려줄 때는 문장 사이 쉼도 그만큼 늘린다
+        sent_gap, comma_gap = silence(s.sentence_gap_ms * stretch), silence(s.comma_gap_ms * stretch)
         try:
             for i, (kind, utext, payload) in enumerate(units):
                 gap = comma_gap if utext.endswith(",") else sent_gap     # 쉼표에서 나눈 조각 뒤는 짧게 쉰다
@@ -1009,7 +1050,18 @@ class Session:
                 seg = {"text": utext, "ms": 0.0}
                 got = False
                 try:
-                    async for c in job.iterate():
+                    if slow:
+                        # 느리게 들려주려면 문장 음성이 다 있어야 한다 (게이트웨이 TTS는 어차피 한 번에 온다 → 첫 소리 손해 없음)
+                        whole = b"".join([c async for c in job.iterate()])
+                        if whole:
+                            got = True
+                            await self._send_text(utext)
+                            self.spoken.append(seg)
+                            self.tl.mark("tts_first", job.stats.get("first"))
+                            if job.stats.get("cache"):
+                                self.tl.count("tts_cache")
+                            await self._send_pcm(self._paced(whole), mark_answer=after_tool, seg=seg)
+                    async for c in (_empty() if slow else job.iterate()):
                         if not got:
                             got = True
                             await self._send_text(utext)
@@ -1077,10 +1129,31 @@ class Session:
         await self._send_text(text)
         seg = {"text": text, "ms": 0.0}
         self.spoken.append(seg)
-        await self._send_pcm(pcm, mark_answer=mark_answer, seg=seg)
+        await self._send_pcm(self._paced(pcm), mark_answer=mark_answer, seg=seg)
 
     async def _send_text(self, text: str) -> None:
         await self._send_json({"type": "agent.transcript", "text": text})
+
+    def _paced(self, pcm: bytes) -> bytes:
+        """재생 속도를 적용한 음성. 같은 녹음 문장은 한 번만 바꿔 둔다. 실패하면 원래 음성."""
+        sp = getattr(self, "play_speed", 1.0)
+        if sp >= 1.0 or not pcm:
+            return pcm
+        key = (len(pcm), hash(pcm), sp)
+        cache = getattr(self, "paced_cache", None)
+        if cache is None:
+            cache = self.paced_cache = {}
+        out = cache.get(key)
+        if out is None:
+            try:
+                out = time_stretch(pcm, sp)
+            except Exception:
+                log.exception("재생 속도 변환 실패 (원래 속도로)")
+                out = pcm
+            if len(cache) > 200:
+                cache.clear()
+            cache[key] = out
+        return out
 
     async def _send_pcm(self, pcm: bytes, mark_answer: bool = False, seg: dict | None = None) -> float:
         """보낸 길이(ms)를 돌려준다. 측정 모드는 곧바로, 시연 모드는 재생 속도에 맞춰 조금씩.

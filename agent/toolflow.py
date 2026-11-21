@@ -137,6 +137,13 @@ def block_reason(name: str, args: dict, ctx: dict) -> str:
         items = args.get("return_items")
         if not isinstance(items, list) or not items or not all(isinstance(x, dict) and x.get("order_item_code") for x in items):
             return "반품할 상품의 상세주문번호가 없다. 접수하지 않았다. 주문 조회 결과의 상세주문번호를 쓴다."
+        known_items = set(ctx.get("items") or [])
+        if known_items:
+            # 조회 결과에 없는 상세주문번호를 지어내 접수하지 않는다 (실측 P0018-05: 다른 주문의 번호를 섞었다)
+            bad = [x.get("order_item_code") for x in items if str(x.get("order_item_code")) not in known_items]
+            if bad:
+                return ("상세주문번호 " + ", ".join(map(str, bad)) + "는 조회 결과에 없다. 접수하지 않았다. "
+                        "조회 결과의 상세주문번호만 쓰고, 주문의 상품을 모두 반품하면 return_order로 전체 반품한다.")
     return ""
 
 
@@ -192,3 +199,89 @@ GUARD_NOTE = ("(시스템: 이번 통화에는 조회 결과가 없는데 확인
 def claims_lookup_without_evidence(answer: str, evidence: str) -> bool:
     """조회 결과가 없는데 '확인해 보니…'라고 답하려는 경우 (연습 P0175-02: 고객이 읽어 준 문자만 보고 배송 중이라고 답함)."""
     return bool(_CLAIM.search(answer or "")) and not (evidence or "").strip()
+
+
+# ───────────────────────── 답 검사 (접수 완료라는 말, 번호 재질문) ─────────────────────────
+# 접수가 성공하지 않았는데 '접수해 드렸습니다'라고 하는 답 (실측 P0074-01: 이미 접수된 건에 "반품 접수해 드렸습니다. 이미 반품이
+# 접수되어 있습니다.", P0031-02: 접수 함수를 부르지도 않고 "반품 접수해 드렸습니다")
+_WRITE_DONE = re.compile(r"(접수해\s*드렸|접수했습니다|접수했어요|접수되었습니다|접수됐습니다|접수됐어요|취소해\s*드렸|취소되었습니다|취소됐습니다|교환\s*접수)")
+ALREADY_SENTENCE = "확인해 보니 이미 반품이 접수되어 있습니다."
+WRITE_NOTE = ("(시스템: 이번 통화에서 성공한 접수가 없는데 접수해 드렸다고 말하려 했다. 그렇게 말할 수 없다. "
+              "접수가 필요하면 필요한 정보를 확인한 뒤 접수 함수를 부르고, 아니면 조회 결과대로 답한다.)")
+
+
+def _status(run) -> str:
+    return str((run.body or {}).get("status") or "") if isinstance(run.body, dict) else ""
+
+
+def write_succeeded(runs: list) -> bool:
+    return any(r.tc.name in WRITES and r.calls and _status(r) in ("ok", "success") for r in runs)
+
+
+def history_write_succeeded(history: list) -> bool:
+    for h in history or []:
+        if h.get("role") == "tool_result" and h.get("name") in WRITES:
+            res = h.get("result")
+            if isinstance(res, dict) and str(res.get("status")) in ("ok", "success"):
+                return True
+    return False
+
+
+def write_claim_check(text: str, runs: list, prior_write: bool) -> tuple[str, str]:
+    """(고친 답, 문제). 문제: '' 없음 / 'already' 이미 접수된 건이라 문장을 바꿈 / 'false_claim' 되돌려 다시 판단해야 함.
+    이번 턴에 접수가 성공했거나, 이전 대화에서 접수가 성공했으면(그 접수를 말하는 것) 그대로 둔다."""
+    if not _WRITE_DONE.search(text or "") or write_succeeded(runs):
+        return text, ""
+    already = any(r.tc.name in WRITES and _status(r) == "already_requested" for r in runs)
+    if already:
+        sents = [x for x in facts.split_sentences(text) if not _WRITE_DONE.search(x)]
+        if not any("이미" in x for x in sents):
+            sents.insert(0, ALREADY_SENTENCE)
+        return " ".join(sents), "already"
+    if prior_write:
+        return text, ""
+    return text, "false_claim"
+
+
+# 번호를 다시 묻는 답: 발신자 번호나 이전 대화의 주문번호가 있으면 조회부터 한다 (실측 P0010-11)
+_ASK_NUMBER = re.compile(r"(주문\s*번호|전화\s*번호|연락처|휴대폰\s*번호).{0,25}(말씀해|알려|불러)")
+NUMBER_NOTE = ("(시스템: 발신자 전화번호나 이전 대화의 주문번호가 있다 ([통화 정보] 참고). 번호를 다시 묻지 말고 "
+               "그 번호로 조회 함수를 먼저 부른다. 고객이 방금 불러 준 번호가 깨져 들렸어도 발신자 번호로 조회할 수 있다.)")
+
+
+def asks_for_number(text: str) -> bool:
+    return bool(_ASK_NUMBER.search(text or ""))
+
+
+def lookup_failed_before(history: list) -> bool:
+    """이전 대화에서 조회가 비었던 적이 있는가 (그러면 다른 번호를 묻는 것이 맞다)."""
+    for h in history or []:
+        if h.get("role") == "tool_result" and h.get("name") in LOOKUPS and facts.lookup_empty(h.get("name"), h.get("result")):
+            return True
+    return False
+
+
+# 반품·환불 진행 문의에 주문 조회만 하는 경우 반품 조회를 함께 부른다 (실측 P0031-02). 조회 함수는 더 불러도 감점이 없다
+_RETURN_STATUS = re.compile(r"((환불|환풀|반품|회수).{0,15}(언제|아직|진행|됐|되었|완료|상황|어떻게\s*되|안\s*(들어|와|됐|돼))"
+                            r"|(언제|아직).{0,10}(환불|환풀|반품|회수))")
+
+
+def add_return_lookup(decision, customer_text: str, caller_phone: str = "") -> bool:
+    """decision.tool_calls에 get_return_info를 더한다 (assistant 메시지도 함께). 더했으면 True."""
+    if not _RETURN_STATUS.search(customer_text or ""):
+        return False
+    names = {tc.name for tc in decision.tool_calls}
+    if "get_return_info" in names or names & WRITES or "get_order_info" not in names:
+        return False
+    src = next(tc for tc in decision.tool_calls if tc.name == "get_order_info")
+    ph = (src.args or {}).get("buyer_cellphone") or caller_phone
+    if not facts.digits(ph):
+        return False
+    args = {"customer_phone_number": ph}
+    raw = json.dumps(args, ensure_ascii=False)
+    new = type(src)(f"{src.id}_ret", "get_return_info", args, raw)
+    decision.tool_calls.append(new)
+    msg = decision.assistant_msg or {}
+    if isinstance(msg.get("tool_calls"), list):
+        msg["tool_calls"].append({"id": new.id, "type": "function", "function": {"name": new.name, "arguments": raw}})
+    return True

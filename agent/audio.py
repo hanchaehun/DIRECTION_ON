@@ -143,3 +143,45 @@ class LeadTrimmer:
         self.done = True
         self.buf = b""
         return b""                           # 끝까지 무음이면 버린다
+
+
+def time_stretch(pcm: bytes, speed: float, rate: int = RATE) -> bytes:
+    """음높이는 그대로 두고 말 속도만 바꾼다 (WSOLA). speed 0.9 → 길이 1/0.9.
+    30ms 창을 15ms 간격으로 이어 붙이되, 앞 조각과 파형이 가장 잘 이어지는 자리를 ±10ms 안에서 찾는다.
+    10초 문장 변환에 약 20ms라 첫 소리 시간에 영향이 없다."""
+    if not pcm or abs(speed - 1.0) < 1e-3:
+        return pcm
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    frame = int(rate * 0.03)
+    hop_out = frame // 2
+    hop_in = hop_out * speed
+    tol = int(rate * 0.01)
+    if len(x) < frame * 3 + tol * 2:
+        return pcm
+    n = int((len(x) - frame - tol - hop_out) / hop_in)
+    if n < 2:
+        return pcm
+    win = np.hanning(frame).astype(np.float32)
+    y = np.zeros(n * hop_out + frame, dtype=np.float32)
+    w = np.zeros_like(y)
+    prev = 0
+    for k in range(n):
+        if k == 0:
+            pos = 0
+        else:
+            nat = prev + hop_out                       # 앞 조각이 자연스럽게 이어지는 자리
+            ref = x[nat:nat + frame]
+            target = int(round(k * hop_in))
+            lo = max(0, target - tol)
+            hi = min(len(x) - frame, target + tol)
+            if hi <= lo or len(ref) < frame:
+                pos = min(max(0, target), len(x) - frame)
+            else:
+                corr = np.correlate(x[lo:hi + frame], ref, mode="valid")
+                pos = lo + int(np.argmax(corr))
+        o = k * hop_out
+        y[o:o + frame] += x[pos:pos + frame] * win
+        w[o:o + frame] += win
+        prev = pos
+    y = y / np.where(w > 0.1, w, 1.0)
+    return np.clip(y, -32768, 32767).astype(np.int16).tobytes()
