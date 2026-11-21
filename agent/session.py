@@ -27,10 +27,12 @@ from websockets.exceptions import ConnectionClosed
 from . import aftertool, facts, knowledge
 from .audio import BYTES_PER_MS, chunks, rms, silence
 from .brain import Decision, parse_now
+from .clips import tool_kind
 from .metrics import Timeline
 from .router import choose_bank, choose_opener
+from .turn import classify
 from .textnorm import for_tts, norm_compare
-from .toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls
+from .toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls, reask_for
 from .tts import TTSError, TTSJob
 
 log = logging.getLogger("session")
@@ -68,6 +70,19 @@ _PLEASANTRY = [(re.compile(r"^\s*(네|예)\s*,?\s*고객님\s*[,.!]?\s*"), "네,
 _YES = re.compile(r"^\s*(네|예)\s*[,.!]\s*")
 _NO = re.compile(r"^\s*(아니요|아뇨|아니오)\s*[,.!]\s*")
 _HANDOFF_SAID = re.compile(r"상담원.{0,6}연결")
+_SENT_END = re.compile(r"[.?!。？！]\s*$")
+_VERB_END = re.compile(r"(요|다|까|죠|니다|세요|어|아|해|네|군|지|래|나|가|고|서|데|라|자|게|걸|냐|니)$")
+
+
+def _noun_only(text: str) -> bool:
+    """물음표 없이 서술어 없는 명사로 끝난 짧은 말인가 ('대장영양제.', '배송 문의.'). 숫자를 불러 준 말은 제외한다."""
+    t = text.strip()
+    if t.endswith(("?", "？")):
+        return False
+    body = re.sub(r"[.?!。？！\s]+$", "", t)
+    if len(re.sub(r"\D", "", body)) >= 7:
+        return False                       # 번호를 불러 준 말은 끝난 것으로 본다
+    return len(re.sub(r"\s", "", body)) <= 14 and not _VERB_END.search(body)
 
 
 @dataclass
@@ -164,6 +179,9 @@ class Session:
         self.first_sound_sent = False
         self.filler_sent = False
         self.opener_text = ""
+        self.turn_customer = ""
+        self.customer_pushed = False
+        self.final_task: asyncio.Task | None = None
         self.turn_end_sent = False
         self.barge = False
         self.stt_turn_reset = False
@@ -241,6 +259,13 @@ class Session:
             return self.audio_ms - self.last_voiced_audio_ms
         return 0.0
 
+    def _similar_pending(self, norm: str) -> bool:
+        """비슷한 받아쓰기로 이미 판정을 요청해 두었으면 다시 부르지 않는다 (실측: 문항당 1~5회 → 호출 수·분당 한도)."""
+        if not self.route_pending:
+            return False
+        import difflib
+        return any(difflib.SequenceMatcher(None, norm, k).ratio() >= self.s.route_reuse_ratio for k in self.route_pending)
+
     def _route_for(self, text: str):
         """이 받아쓰기에 대한 Jev 판정. 판정을 요청한 뒤 받아쓰기가 조금 바뀌어도(문장부호, 끝 글자) 거의 같으면 쓴다.
         (실측: 정확히 같은 글만 인정했더니 6문항 중 4문항에서 판정을 쓰지 못했다)"""
@@ -268,7 +293,7 @@ class Session:
         # 판정 모델: 조용해지면 한 번 부른다 (받아쓰기가 바뀌면 다시)
         pause = s.live_router_pause_ms if self.mode == "live" else s.router_pause_ms
         if (s.use_router and norm and quiet and silence_ms >= pause
-                and norm not in self.routes and norm not in self.route_pending):
+                and norm not in self.routes and not self._similar_pending(norm) and self._route_for(text) is None):
             self.route_pending.add(norm)
             asyncio.create_task(self._run_router(text, norm))
         # 추측 실행 (시연 모드): 쉼에서 LLM을 미리 돌려 답까지의 시간을 줄인다. 점수에는 영향이 없어 측정 모드에서는 끈다
@@ -289,7 +314,10 @@ class Session:
             return None
         if self.voiced_now:
             # 소음 경로: 무음이 잡히지 않지만 STT는 끝났다고 보고 새 토큰도 없다
+            # 진짜 소음이면 소리가 몇 초씩 끊김 없이 이어진다. 쉬었다가 다시 말을 시작한 순간에는 쓰지 않는다
+            # (실측 P0130-01: 1.8초 쉼 뒤 다시 말하기 시작하자 이 규칙으로 커밋해 끼어듦)
             if (self.stt.end_seen and norm and self.stt.last_token_wall
+                    and self.voiced_run_ms >= s.noise_commit_min_voiced_ms
                     and (now - self.stt.last_token_wall) * 1000 >= s.noise_commit_token_idle_slow_ms):
                 return "noise"
             return None
@@ -297,7 +325,21 @@ class Session:
             return "no_text" if silence_ms >= s.no_text_commit_ms else None
         r = self._route_for(text)
         live = self.mode == "live"
-        if r is None:
+        t = text.strip()
+        if t.endswith((",", "，", "…", "-")):
+            # 쉼표·말줄임으로 끝남: 이어서 말하는 중이다 (실측 P0130-01: '대장 영양제,' 뒤 1.8초 쉬고 이어 말함)
+            thr, name = s.commit_comma_ms, "comma"
+        elif classify(t, "", s) == "preamble":
+            # 인사·용건 예고뿐: 뒤에 본론이 이어지는 경우가 많다
+            thr, name = s.commit_preamble_ms, "preamble"
+        elif _SENT_END.search(t) and _noun_only(t):
+            # 서술어 없이 명사로만 끝난 말: 이어서 말할 수 있다 (실측 P0130-01: '대장영양제.' 뒤 1.8초 쉬고 이어 말함 → 끼어듦)
+            thr, name = (s.live_commit_mid_ms if live else s.commit_noun_ms), "noun"
+        elif _SENT_END.search(t):
+            # Soniox는 말이 끝나면 문장부호를 붙인다. 실측: Jev는 '…내야 하나요?' 같은 끝난 질문도 0.2로 판정해
+            # 28문항 중 4문항이 1.5초를 넘겼고, Jev 덕분에 끼어들기를 막은 사례는 없었다 → 문장부호가 있으면 끝난 말로 본다
+            thr, name = (s.live_commit_fast_ms if live else s.commit_complete_ms), "punct"
+        elif r is None:
             thr, name = s.commit_silence_ms, "silence"
         elif r.complete >= s.complete_min_prob:
             if live:
@@ -476,6 +518,12 @@ class Session:
 
     async def _finish_interrupted(self) -> None:
         await self._send_json({"type": "agent.cancel"})
+        ft = getattr(self, "final_task", None)
+        if ft is not None and not ft.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(ft), 1.0)   # 끊긴 턴의 손님 말을 이력에 남기기 위해
+            except Exception:
+                pass
         played = self._remember_agent_turn(interrupted=True)
         if self.s.live_agent_text:
             await self.stt.send_agent_text("", end_of_segment=True)   # 들려준 데까지만, 세그먼트 닫기
@@ -483,6 +531,7 @@ class Session:
 
     def _remember_agent_turn(self, interrupted: bool) -> str:
         """실제로 재생된 부분까지만 이력에 남긴다. 재생 위치는 보낸 길이와 클라이언트 버퍼로 추정."""
+        self._push_customer()
         unplayed = max(0.0, self.play_end - perf()) * 1000 if interrupted else 0.0
         parts = []
         for seg in reversed(self.spoken):
@@ -515,6 +564,7 @@ class Session:
         final = self.stt.final_text() or self.stt.text()
         self.tl.info["transcript"] = final
         self.tl.mark("final_text")
+        self.turn_customer = final
         if self.mode == "measure":
             asyncio.create_task(self.stt.close())          # 동시 스트림 한도 보호
         else:
@@ -522,12 +572,21 @@ class Session:
             self.stt_turn_reset = True
         return final
 
+    def _push_customer(self) -> None:
+        """이번 턴의 손님 말을 이력에 한 번만 남긴다 (끼어들기로 응답이 취소돼도 남도록 턴 끝에서도 부른다)."""
+        if self.turn_customer and not self.customer_pushed:
+            self.history.append({"role": "customer", "text": self.turn_customer})
+            self.customer_pushed = True
+
     async def _respond(self) -> None:
         s = self.s
         self.phase = "responding"
         t_commit = perf()
         text0 = self.stt.text()
         route = self._route_for(text0)
+        # 확정 받아쓰기는 별도 작업으로 바로 시작한다. 첫 소리를 기다리지 않게 하고, 시연 모드에서 말하는 도중
+        # 끼어들어 응답이 취소돼도 받아쓰기는 다음 턴으로 넘어가게 한다 (실측: 이전 턴 글이 다음 턴에 섞였다)
+        self.final_task = asyncio.create_task(self._finalize_transcript(t_commit))
         # 1. 첫 소리: 은행 직행 또는 첫마디. 확정 받아쓰기를 기다리지 않는다 (1.5초 안에 나가야 한다)
         bank_clip, opener_kind = None, ""
         if text0.strip():
@@ -542,14 +601,14 @@ class Session:
                 opener_kind = choose_opener(text0, route, s)
                 await self._opener(opener_kind)
         # 2. 확정 받아쓰기
-        final = await self._finalize_transcript(t_commit)
+        final = await asyncio.shield(self.final_task)
         if not final.strip():
             self.tl.info["decision"] = "empty"
             if bank_clip is None:
                 await self._say_clip("fallback")
             return
         if bank_clip is not None:
-            self.history.append({"role": "customer", "text": final})
+            self._push_customer()
             await self._drain()
             return
         # 3. 판단: 추측 결과가 확정 받아쓰기와 같으면 그대로 쓴다 (시연 모드)
@@ -564,7 +623,7 @@ class Session:
             msgs = self.ctx.brain.build_messages(self.history, final, self.caller, self.now,
                                                  ctx=self.ctx_ids, spoken=self.opener_text)
             task = asyncio.create_task(self._decide(msgs, s.reasoning_effort))
-        self.history.append({"role": "customer", "text": final})
+        self._push_customer()
         decision = await task
         self.tl.mark("decision")
         self.tl.info["decision"] = decision.kind
@@ -605,6 +664,12 @@ class Session:
                 self.tl.event("tool_blocked", reason="tools_url 없음")
                 await self._say_clip("fallback")
                 return
+            if self.mode == "live" and rounds == 0:
+                # 시연 모드: 사람 상담원처럼 "주문 내역 확인해 드리겠습니다"를 이어 말한다 (조회 동안 4초 넘는 침묵 방지)
+                kind = tool_kind(decision.tool_calls[0].name, self.ctx.phrases)
+                clip = self.ctx.clips.pick(kind + "_cont" if self.filler_sent else kind)
+                if clip:
+                    self._enqueue(clip[0], clip[1] + silence(self.s.filler_tail_silence_ms))
             if self.mode == "measure" and self.filler_sent and rounds == 0:
                 # 첫마디가 측정기에 다 도착한 뒤에 호출한다 (꼬리가 '조회 뒤 답'으로 잡히지 않게)
                 gap = s.tool_gap_after_filler_ms / 1000 - (perf() - (self.tl.t0 + self.tl.marks.get("opener_sent", 0)))
@@ -625,6 +690,16 @@ class Session:
                     after_tool = True
             self.evid += evidence_text(runs) + "\n"
             self._refresh_context()
+            rk = reask_for(runs)
+            if rk:
+                # 번호가 깨져 들려 모든 호출이 막혔다: LLM을 거치지 않고 구체적으로 다시 묻는다
+                clip = self.ctx.clips.bank(rk)
+                self.tl.event("reask", kind=rk)
+                self.tl.count("reask")
+                if clip:
+                    await self._drain()
+                    await self._speak(clip[0], clip[1])
+                    return
             rounds += 1
             msgs.append({"role": "system", "content": aftertool.note()})
             decision = await self._decide(msgs, s.reasoning_effort_round2)

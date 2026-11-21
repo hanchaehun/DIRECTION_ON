@@ -32,7 +32,7 @@ from agent.clips import ClipBank, load_phrases  # noqa: E402
 from agent.config import RUNTIME, Settings, env  # noqa: E402
 from agent.router import Router, choose_bank, choose_opener  # noqa: E402
 from agent.session import normalize_history  # noqa: E402
-from agent.toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls  # noqa: E402
+from agent.toolflow import GUARD_NOTE, claims_lookup_without_evidence, evidence_text, execute_calls, reask_for  # noqa: E402
 from mock_tools.server import Store  # noqa: E402
 
 OFFICIAL = ROOT.parent / "directon-2026-voice-cs"
@@ -99,6 +99,12 @@ async def run_case(case, text: str, brain: Brain, router: Router, clips: ClipBan
                          {"role": "tool_result", "name": run.tc.name, "result": run.body}]
         evid += evidence_text(runs) + "\n"
         ctx = facts.context_ids(hist + new_hist, caller)
+        rk = reask_for(runs)
+        if rk:
+            out["notes"].append(f"번호 다시 묻기({rk})")
+            out.update(path=f"llm→reask:{rk}", answer=clips.bank_text(rk), said=(opener + " " + clips.bank_text(rk)).strip(),
+                       llm_calls=llm_calls, sentences=1, bank_sentences=1)
+            return out
         rounds += 1
         msgs.append({"role": "system", "content": aftertool.note()})
         d = await brain.decide(msgs, tools, s.reasoning_effort_round2)

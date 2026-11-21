@@ -52,7 +52,10 @@ class Settings:
     undecided_wait_ms: int = 1200
     # ── 말 끝 판단 (무음 길이 + Jev) ──
     commit_silence_ms: int = 1100        # Jev 판정이 없을 때: 무음이 이만큼이면 말 끝 (첫 소리 약 1.13초, 만점 한도 1.5초)
-    commit_complete_ms: int = 1000       # Jev가 끝난 말로 볼 때 (측정 모드)
+    commit_comma_ms: int = 2400          # 쉼표·말줄임으로 끝난 말 (이어서 말하는 중)
+    commit_noun_ms: int = 2000          # 서술어 없이 명사로 끝난 짧은 말 (이어서 말할 수 있다)
+    commit_preamble_ms: int = 1600      # 인사·용건 예고뿐일 때 (뒤에 본론이 이어질 수 있다)
+    commit_complete_ms: int = 1000      # Jev가 끝난 말로 볼 때 (측정 모드)
     commit_incomplete_ms: int = 1600     # Jev가 덜 끝난 말로 볼 때 (0.25~0.5)
     commit_very_incomplete_ms: int = 2000  # Jev가 말하다 멈춘 것으로 볼 때 (0.25 미만)
     no_text_commit_ms: int = 1800        # 말소리는 있었는데 받아쓰기가 비어 있을 때
@@ -76,6 +79,7 @@ class Settings:
     complete_min_prob: float = 0.5       # 이 이상이면 말이 끝난 것으로 본다
     llm_judge: bool = False             # 애매한 끝맺음에 LLM 완결성 판정 (게이트웨이 호출당 마스킹 5크레딧·분당 120건 한도로 기본 끔)
     noise_commit_token_idle_ms: int = 800
+    noise_commit_min_voiced_ms: int = 3000   # 소음 경로는 말소리가 이만큼 끊김 없이 이어질 때만
     noise_commit_token_idle_slow_ms: int = 2400
     finalize_wait_ms: int = 300          # 커밋 시 확정 받아쓰기 대기 상한 (4.4절 1~2단계 합계)
     order_id_digit_lengths: list = field(default_factory=lambda: [15])   # 하루온 주문번호 20261101-0001234 (8+7자리)

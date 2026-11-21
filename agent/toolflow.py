@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from . import facts
+from . import facts, knowledge
 from .textnorm import normalize_tool_args
 
 LOOKUPS = {"get_order_info", "get_return_info"}
@@ -25,14 +25,64 @@ class ToolRun:
     content: str = ""          # LLM에 넘길 요약
     notes: list = field(default_factory=list)
     blocked: str = ""          # 실행하지 않은 이유
+    reask: str = ""            # 번호가 깨져 들려 막혔을 때 다시 물을 은행 문장 키 (reask_phone / reask_order / reask_any)
     calls: list = field(default_factory=list)   # 실제로 나간 호출 [(name, args, status_code, ms)]
 
 
+_HEALTH = ("간", "눈", "관절", "연골", "기관지", "호흡", "목", "혈관", "혈당", "콜레스테롤", "배변", "변비", "장", "대장", "위",
+           "소화", "전립선", "갱년기", "수면", "숙면", "멜라토닌", "프로폴리스", "면역", "비타민", "오메가", "이눌린", "피로", "숙취",
+           "세트", "영양제", "가드", "맥스", "88")
+
+
+def product_mentioned(query: str) -> bool:
+    """검색어에 제품명 조각이나 건강 고민이 있는가. 없으면 모의 서버가 아무 제품이나 '가장 가까운 기록'으로 돌려준다
+    (실측: 받아쓰기 '선박스 효과'로 검색해 기관지 제품으로 답함)."""
+    q = __import__("re").sub(r"\s+", "", str(query or "")).replace("하루온", "")
+    if not q:
+        return False
+    tokens = set()
+    for n in knowledge.product_names():
+        for w in __import__("re").split(r"[\s&]+", n.replace("하루온", "")):
+            if len(w) >= 2:
+                tokens.add(w)
+    return any(t in q for t in tokens) or any(h in q for h in _HEALTH)
+
+
+def reask_kind(name: str, args: dict, blocked: str) -> str:
+    """번호가 깨져 들려 막힌 경우 어떤 번호를 다시 물을지. 손님 음성의 숫자가 사람이 들어도 이상한 경우가 있어
+    (연습 P0052-02) 무엇을 어떻게 말해 달라는지 구체적으로 묻는다."""
+    if not blocked or "정확" not in blocked:
+        return ""
+    if name in ("request_callback", "get_return_info"):
+        return "reask_phone"
+    if name in ("cancel_order", "return_order", "exchange_order"):
+        return "reask_order"
+    if name == "get_order_info":
+        ph, oid = facts.digits(args.get("buyer_cellphone")), facts.digits(args.get("order_id"))
+        guess = ph or oid
+        if guess.startswith("20") and len(guess) >= 12:
+            return "reask_order"                 # 날짜처럼 시작하는 긴 번호는 주문번호를 말하려던 것
+        if ph or (guess and len(guess) <= 12):
+            return "reask_phone"
+        return "reask_any"
+    return ""
+
+
+def reask_for(runs: list) -> str:
+    """모든 호출이 '번호가 깨져서' 막혔으면 다시 물을 은행 문장 키. LLM을 거치지 않고 바로 묻는다 (문구 고정, 약 1.7초 단축)."""
+    if not runs or not all(r.blocked and r.reask for r in runs):
+        return ""
+    kinds = {r.reask for r in runs}
+    return kinds.pop() if len(kinds) == 1 else "reask_any"
+
+
 def block_reason(name: str, args: dict, ctx: dict) -> str:
-    """접수 함수를 실행하면 안 되는 경우. 번호가 깨져 들린 채로 접수하면 틀린 호출이 된다."""
+    """함수를 실행하면 안 되는 경우. 번호가 깨져 들린 채로 접수·조회하면 틀린 호출이 된다."""
+    if name == "search_products" and not product_mentioned(args.get("query")):
+        return "검색어에 제품명이나 건강 고민이 없다. 검색하지 않았다. 고객에게 어떤 제품을 문의하시는지 여쭌다."
     if name == "request_callback":
         if not facts.valid_phone(args.get("phone_number")):
-            return "전화번호가 정확하지 않다. 접수하지 않았다. 고객에게 전화번호를 다시 한 번 천천히 말씀해 달라고 한다."
+            return "전화번호가 정확하지 않다. 접수하지 않았다."
         if not str(args.get("customer_name") or "").strip():
             return "성함이 없다. 접수하지 않았다. 고객에게 성함을 여쭌다."
     if name in ("cancel_order", "return_order", "exchange_order"):
@@ -44,11 +94,10 @@ def block_reason(name: str, args: dict, ctx: dict) -> str:
     if name == "get_order_info":
         ph, oid = args.get("buyer_cellphone"), args.get("order_id")
         if not ((ph and facts.valid_phone(ph)) or (oid and facts.valid_order_id(oid))):
-            return ("번호가 정확히 들리지 않았다 (전화번호도 주문번호도 형식이 맞지 않음). 조회하지 않았다. "
-                    "고객에게 주문번호나 전화번호를 다시 한 번 천천히 말씀해 달라고 한다.")
+            return "번호가 정확히 들리지 않았다 (전화번호도 주문번호도 형식이 맞지 않음). 조회하지 않았다."
     if name == "get_return_info":
         if not facts.valid_phone(args.get("customer_phone_number")):
-            return "전화번호가 정확히 들리지 않았다. 조회하지 않았다. 고객에게 전화번호를 다시 한 번 천천히 말씀해 달라고 한다."
+            return "전화번호가 정확히 들리지 않았다. 조회하지 않았다."
     if name == "return_order_item":
         items = args.get("return_items")
         if not isinstance(items, list) or not items or not all(isinstance(x, dict) and x.get("order_item_code") for x in items):
@@ -63,8 +112,9 @@ async def execute_calls(calls: list, ctx: dict, call_fn, s, now: datetime) -> li
         args = normalize_tool_args(tc.args if isinstance(tc.args, dict) else {}, s)
         args, notes = facts.resolve_ids(tc.name, args, ctx)
         run = ToolRun(tc, args, notes=notes)
-        if tc.name in WRITES or tc.name in LOOKUPS:
+        if tc.name in WRITES or tc.name in LOOKUPS or tc.name == "search_products":
             run.blocked = block_reason(tc.name, args, ctx)
+            run.reask = reask_kind(tc.name, args, run.blocked)
         runs.append(run)
 
     async def one(run: ToolRun) -> None:
@@ -96,7 +146,10 @@ def evidence_text(runs: list[ToolRun]) -> str:
     return "\n".join(r.content for r in runs)
 
 
-_CLAIM = __import__("re").compile(r"(확인해\s*보니|조회해\s*보니|확인\s*결과|조회\s*결과)")
+# 조회·접수 결과를 말하는 표현. '접수되어 있어요'(이전 통화의 접수를 안내)는 넣지 않는다.
+# 실측: 쿠팡 반품 문의(P0043)에 조회 없이 '말씀하신 번호로는 반품 신청 내역이 확인되지 않습니다'라고 답했다.
+_CLAIM = __import__("re").compile(r"(확인해\s*보니|조회해\s*보니|확인\s*결과|조회\s*결과|번호로는.{0,14}(확인|조회)되지|"
+                                  r"접수해\s*드렸|접수했습니다|조회되는\s*(주문|내역)이\s*없)")
 GUARD_NOTE = ("(시스템: 이번 통화에는 조회 결과가 없는데 확인했다고 말하려 했다. 그렇게 말할 수 없다. "
               "주문번호나 전화번호가 있으면 조회 함수를 부르고, 없으면 번호를 여쭌다.)")
 
